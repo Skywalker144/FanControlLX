@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>FanControlLX · 风扇控制台</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="FanControlLX 首页"><img src="/favicon.svg" alt=""><span>FanControl<span class="lx">LX</span><small>LINUX COOLING CONTROL</small></span></a>
+    <div class="sidebar-label">工作空间</div>
+    <nav aria-label="主导航">
+      <button class="nav active" data-tab="control"><span>◈</span> 风扇控制台 <span class="nav-count" id="fan-count">0</span></button>
+      <button class="nav" data-tab="sensors"><span>⌁</span> 硬件传感器</button>
+      <button class="nav" data-tab="diagnostics"><span>⊞</span> 设备与诊断 <i id="diagnostic-dot"></i></button>
+    </nav>
+    <div class="sidebar-label fan-list-heading">我的风扇 <button id="add-fan" class="icon-button" aria-label="添加风扇">＋</button></div>
+    <div id="fan-list"></div>
+    <div class="sidebar-bottom"><div class="connection"><i id="connection-dot"></i><span id="connection-text">正在连接本机</span></div><div id="machine-name">本地 Web 服务</div><div class="version">FanControlLX <span id="version">0.3.0</span><span>LOCAL ONLY</span></div></div>
+  </aside>
+
+  <main>
+    <header><div><div class="eyebrow">THERMAL WORKSPACE <span>/</span> <span id="tab-english">FAN CONTROL</span></div><h1 id="page-title">让散热，恰到好处<span class="heading-dot">.</span></h1><p id="page-subtitle">观察温度，绘制曲线，让每一颗风扇按你的方式运转。</p></div><div class="header-actions"><span class="mode-badge" id="mode-badge">监控模式</span><button class="button secondary" id="release-all">释放全部控制</button></div></header>
+
+    <div id="connection-error" class="banner error" hidden>连接已中断。页面显示的是上次读数，服务状态未知；请检查启动终端。<button id="retry">重新连接</button></div>
+    <div id="hardware-banner" class="banner" hidden><span class="banner-icon">ⓘ</span><div><strong id="banner-title"></strong><p id="banner-description"></p></div><button class="text-button" id="show-diagnostics">查看诊断 ↗</button></div>
+    <section class="metrics" aria-label="实时监控">
+      <article class="metric"><div class="metric-label"><span class="metric-icon">▣</span>CPU 温度<span class="live-label">LIVE</span></div><div class="metric-value"><span id="cpu-temp">—</span><small>°C</small></div><svg id="cpu-spark" class="spark" viewBox="0 0 200 42" aria-label="CPU 温度趋势"></svg><div class="metric-caption" id="cpu-caption">等待传感器</div></article>
+      <article class="metric"><div class="metric-label"><span class="metric-icon">▤</span>GPU 温度<span class="live-label">LIVE</span></div><div class="metric-value"><span id="gpu-temp">—</span><small>°C</small></div><svg id="gpu-spark" class="spark blue" viewBox="0 0 200 42" aria-label="GPU 温度趋势"></svg><div class="metric-caption" id="gpu-caption">等待传感器</div></article>
+      <article class="metric"><div class="metric-label"><span class="metric-icon">✣</span>硬件通道</div><div class="metric-value"><span id="channel-count">—</span><small>个 PWM</small></div><div class="metric-caption" id="channel-caption">正在检测主板接口</div></article>
+      <article class="metric"><div class="metric-label"><span class="metric-icon">◴</span>控制服务</div><div class="metric-value service-value" id="service-value">连接中</div><div class="metric-caption"><span class="mini-dot"></span><span id="service-caption">每秒更新 · 在本机运行</span></div></article>
+    </section>
+
+    <section id="tab-control">
+      <section class="discovery-section" aria-label="发现并识别风扇">
+        <div class="workspace-heading"><div><h2>发现并识别风扇 <span class="tag">DEVICE SETUP</span></h2><p>扫描硬件 → 用滑块辨认实际位置 → 重命名 → 设置温度曲线。</p></div><button id="scan-fans" class="button secondary small">↻ 重新扫描</button></div>
+        <div class="discovery-summary"><span id="discovery-summary">正在扫描硬件通道</span><span>扫描只读取硬件，不会改变风速。</span></div>
+        <div id="discovered-fans" class="discovery-cards"></div>
+        <details id="unconfirmed-channels" class="unconfirmed-channels"><summary id="unconfirmed-summary">其他待确认通道</summary><p>0 RPM 可能是没有接线、风扇停转，或测速尚未配对。可逐个测试确认，不将它们直接算作已连接风扇。</p><div id="unconfirmed-fans" class="discovery-cards"></div></details>
+      </section>
+      <div class="workspace-heading"><div><h2>风扇曲线 <span class="tag">CURVE EDITOR</span></h2><p>为每个风扇定义温度与控制输出之间的关系。</p></div><div class="toolbar"><button class="button secondary small" id="import-config">导入配置</button><button class="button secondary small" id="export-config">导出配置</button><input type="file" id="import-file" accept="application/json,.json" hidden></div></div>
+      <div id="editor-empty" class="panel fan-empty" hidden>尚未检测到有测速信号的风扇。请检查驱动，或在“其他待确认通道”中测试并确认设备。</div>
+      <div class="editor-grid">
+        <article class="panel curve-panel"><div class="panel-top"><div class="curve-title"><span class="color-dot"></span><input id="fan-name" aria-label="风扇名称" maxlength="100"><span id="binding-badge" class="subtle-tag">待绑定</span></div><div class="preset-controls"><label for="preset">预设</label><select id="preset"><option value="custom">自定义</option><option value="quiet">安静</option><option value="balanced">均衡</option><option value="performance">性能</option><option value="flat">固定 50%</option></select></div></div>
+          <div class="chart-meta"><span>控制输出 <b>%</b></span><span class="chart-current" id="chart-current">等待温度</span></div>
+          <svg id="curve-chart" viewBox="0 0 800 330" role="application" aria-label="温度与风扇输出曲线。拖动节点调整，双击空白添加节点；节点可用方向键微调，Delete 删除。"></svg>
+          <div class="chart-footer"><span><i class="legend-dot"></i>目标曲线 <i class="legend-dot live-dot"></i>当前输入</span><span>温度 °C</span></div>
+          <div class="chart-hint"><span>↗ 拖拽调整节点 · 双击添加 · 右键删除</span><button id="reset-curve" class="text-button">恢复均衡曲线</button></div>
+          <div class="points-heading"><strong>曲线节点</strong><span id="point-count">5 个节点</span><button id="add-point" class="text-button">＋ 添加节点</button></div>
+          <div id="point-list" class="point-list"></div>
+        </article>
+        <aside class="panel settings-panel"><div class="panel-top"><h3>控制设置</h3><span class="tag">PER FAN</span></div>
+          <div class="settings-body">
+            <label class="field-label" for="channel-select">PWM 硬件通道</label><select id="channel-select"></select><p id="channel-help" class="field-help">绑定硬件后可启用实际控制。</p>
+            <label class="field-label" for="rpm-select">测速通道 <span>可选</span></label><select id="rpm-select"></select>
+            <label class="autostart-choice"><input id="autostart-control" type="checkbox"><span>由后台持续控制<small>保存后应用，开机自动恢复</small></span></label><p id="autostart-help" class="field-help"></p>
+            <div class="settings-divider"></div>
+            <label class="field-label" for="source-select">温度来源</label><select id="source-select"></select>
+            <details id="mix-details"><summary>组合多个温度源</summary><div id="sensor-checkboxes"></div><label class="field-label" for="aggregation">混合方式</label><select id="aggregation"><option value="max">取最高温度 Max</option><option value="average">取平均温度 Average</option><option value="min">取最低温度 Min</option></select></details>
+            <label class="field-label" for="mode-select">控制方式</label><select id="mode-select"><option value="curve">跟随温度曲线</option><option value="manual">固定百分比</option></select>
+            <div id="manual-field" hidden><label class="field-label" for="manual-duty">固定输出 %</label><input id="manual-duty" type="number" min="20" max="100" step="1"></div>
+            <div class="field-row"><label>最低输出 %<input id="min-duty" type="number" min="20" max="100" step="1"></label><label>最高输出 %<input id="max-duty" type="number" min="20" max="100" step="1"></label></div>
+            <details class="advanced"><summary>平滑与保护设置</summary><div class="field-row"><label>温度回差 °C<input id="hysteresis" type="number" min="0" max="15" step="0.5"></label><label>响应时间 s<input id="response" type="number" min="0" max="30"></label></div><div class="field-row"><label>时间平均 s<input id="smoothing" type="number" min="0" max="60"></label><label>保护温度 °C<input id="critical" type="number" min="50" max="105"></label></div><div class="field-row"><label>升速 %/s<input id="step-up" type="number" min="1" max="100"></label><label>降速 %/s<input id="step-down" type="number" min="1" max="100"></label></div><p class="field-help">缺失温度源或任一原始温度达到保护阈值时，跳过平滑与限速，输出 100%。此版本最低输出为 20%，不提供自动停转。</p></details>
+          </div>
+          <div class="settings-bottom"><div id="save-status">配置尚未修改</div><button id="save-config" class="button primary">保存配置 <span>↗</span></button><p id="save-help">保存会释放已接管风扇，启用后再应用。</p></div>
+        </aside>
+      </div>
+      <div class="workspace-heading lower"><div><h2>风扇运行状态</h2><p>只有“正在控制”表示已应用曲线；新发现的设备默认保持原来的硬件控制。</p></div><button id="add-fan-bottom" class="button secondary small">＋ 添加离线配置</button></div>
+      <div id="fan-cards" class="fan-cards"></div>
+    </section>
+
+    <section id="tab-sensors" hidden><div class="workspace-heading"><div><h2>硬件传感器</h2><p>来自 Linux hwmon 与 NVIDIA 驱动的实时读数。无效读数显示为不可用。</p></div></div><div class="panel table-wrap"><table><thead><tr><th>传感器</th><th>设备</th><th>类型</th><th>当前读数</th></tr></thead><tbody id="sensor-table"></tbody></table></div></section>
+    <section id="tab-diagnostics" hidden><div class="workspace-heading"><div><h2>设备与诊断</h2><p>检查驱动、通道权限与控制服务状态。</p></div><button id="download-diagnostics" class="button secondary small">下载诊断</button></div><div id="diagnostics-content"></div><div class="workspace-heading lower"><h2>运行日志</h2></div><div id="event-list" class="panel event-list"></div></section>
+    <footer><span>你的曲线，你的散热节奏。</span><span id="last-update">等待首次更新</span></footer>
+  </main>
+  <div id="toast" role="status" hidden></div>
+  <dialog id="identify-dialog" class="identify-dialog">
+    <div class="identify-heading"><div><div class="eyebrow">FAN IDENTIFICATION</div><h2 id="identify-title">识别风扇</h2></div><button id="identify-close" class="icon-button" aria-label="关闭并恢复测试前状态">×</button></div>
+    <p id="identify-channel" class="identify-channel"></p>
+    <p>先提高输出，观察哪一颗风扇加速，再按实际位置命名。一次仅测试一个通道。</p>
+    <div class="identify-live"><div><span id="identify-rpm">—</span><small>RPM · 实时测速</small></div><div><span id="identify-hardware-duty">—</span><small>% · 硬件当前输出</small></div></div>
+    <label class="field-label" for="identify-kind">实际接入设备</label><select id="identify-kind"><option value="unknown">尚未确认</option><option value="fan">普通风扇</option><option value="pump">水泵</option></select>
+    <p id="identify-pump-help" class="field-help" hidden>Pump 接口可能接风扇或水泵。未确认是普通风扇之前，测试仅允许 100%。</p>
+    <div class="identify-slider-label"><label for="identify-slider">识别测试输出</label><output id="identify-output" for="identify-slider">100%</output></div>
+    <input id="identify-slider" type="range" min="50" max="100" step="1" value="100" aria-label="识别测试输出百分比">
+    <div class="identify-slider-bounds"><span id="identify-min">50%</span><span>100%</span></div>
+    <div class="identify-test-actions"><button id="identify-apply" class="button secondary">应用滑块输出</button><button id="identify-full" class="button primary">开到 100% 辨认</button><button id="identify-stop" class="text-button" disabled>结束测试，恢复原状态</button></div>
+    <p id="identify-test-status" class="identify-test-status" role="status">尚未改变风速</p>
+    <p class="field-help">滑块在测试期间松开即可应用。15 秒无操作、关闭此窗口或点击结束，都会恢复测试前状态；测试不会修改温度曲线。</p>
+    <div class="settings-divider"></div>
+    <label class="field-label" for="identify-name">这是什么位置的风扇？</label><input id="identify-name" maxlength="100" placeholder="例如：前置进风、后置排风、CPU 散热">
+    <div class="dialog-actions"><button id="identify-save" class="button primary">确认身份并保存名称 ↗</button></div>
+  </dialog>
+  <dialog id="add-dialog"><form method="dialog"><h2>添加风扇配置</h2><p>可以先绘制曲线，待驱动就绪后再绑定硬件。</p><label class="field-label" for="new-fan-name">风扇名称</label><input id="new-fan-name" placeholder="例如：前置进风风扇" maxlength="100" required><div class="dialog-actions"><button class="button secondary" value="cancel" formnovalidate>取消</button><button class="button primary" value="add">添加风扇</button></div></form></dialog>
+</body>
+</html>
