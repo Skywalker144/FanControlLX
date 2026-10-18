@@ -1,0 +1,29 @@
+[Unit]
+Description=FanControlLX background fan controller
+After=systemd-modules-load.service network.target
+RequiresMountsFor=@PROJECT_DIR@
+StartLimitIntervalSec=180
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=root
+Group=root
+WorkingDirectory=@WORKING_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=/usr/sbin/modprobe nct6687 msi_fan_brute_force=1
+ExecStart=/usr/bin/python3 -m fancontrollx.daemon --data-dir @DATA_DIR@
+Restart=on-failure
+# Let the driver's 15-second watchdog restore firmware state before a crash restart.
+RestartSec=20
+TimeoutStopSec=25
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=full
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
