@@ -201,7 +201,7 @@ def main(service=False):
             for path in Path("/proc").glob("[0-9]*/comm"):
                 if read_text(path) in ("coolercontrold", "fancontrol", "fan2go", "thinkfan"):
                     raise RuntimeError("检测到其他风扇控制进程，请先停止它再启用 --control")
-        engine = Engine(DemoHardware() if args.demo else Hardware(),
+        engine = Engine(DemoHardware() if args.demo else Hardware(data_dir=args.data_dir if args.control else None),
                         args.data_dir / ("config.demo.json" if args.demo else "config.json"),
                         args.control, args.demo, managed=service)
         server = Server((args.host, args.port), engine)
