@@ -34,12 +34,12 @@ def quote_unit_path(path, command=False):
     return '"' + value + '"'
 
 
-def render_unit(project, data_dir):
+def render_unit(project, data_dir, load_nct6687=True):
     template = (ROOT / "systemd/fancontrollx.service.in").read_text()
     working_dir = str(project)
     if any(c in working_dir for c in "\n\r\0"):
         raise ValueError("安装路径不能包含换行符")
-    return template.replace("@PROJECT_DIR@", quote_unit_path(project)).replace(
+    return template.replace("@DRIVER_PRE@", "ExecStartPre=/usr/sbin/modprobe nct6687 msi_fan_brute_force=1" if load_nct6687 else "").replace("@PROJECT_DIR@", quote_unit_path(project)).replace(
         "@WORKING_DIR@", working_dir.replace("%", "%%")).replace(
         "@DATA_DIR@", quote_unit_path(data_dir, command=True))
 
@@ -74,6 +74,7 @@ def main():
     parser = argparse.ArgumentParser(description="安装 FanControlLX systemd 后台服务")
     parser.add_argument("--enable-confirmed", action="store_true", help="为当前已确认并绑定的设备启用后台持续控制")
     parser.add_argument("--dry-run", action="store_true", help="仅预览配置和服务，不修改系统、不接管硬件")
+    parser.add_argument("--skip-driver", action="store_true", help="使用已安装的硬件驱动；仅安装服务，适合 NVIDIA 显卡控制")
     args = parser.parse_args()
     config_path = ROOT / "data/config.json"
     module = ROOT / ".runtime/nct6687d/nct6687.signed.ko"
@@ -82,19 +83,24 @@ def main():
             raise ValueError("请先在网页中识别设备并保存配置")
         raw = json.loads(config_path.read_text())
         config = prepare_config(raw, args.enable_confirmed)
-        if not module.is_file():
-            raise ValueError(f"未找到已签名驱动：{module}")
         kernel = os.uname().release
-        vermagic = command(["/usr/sbin/modinfo", "-F", "vermagic", str(module)], capture_output=True, text=True).stdout.strip()
-        if not vermagic or vermagic.split()[0] != kernel:
-            raise ValueError("驱动与当前内核不匹配，请为当前内核重新编译并签名驱动")
-        signer = command(["/usr/sbin/modinfo", "-F", "signer", str(module)], capture_output=True, text=True).stdout.strip()
-        if not signer:
-            raise ValueError("模块没有签名；请先完成签名和证书登记")
+        if not args.skip_driver:
+            if not module.is_file():
+                raise ValueError(f"未找到已签名驱动：{module}")
+            vermagic = command(["/usr/sbin/modinfo", "-F", "vermagic", str(module)], capture_output=True, text=True).stdout.strip()
+            if not vermagic or vermagic.split()[0] != kernel:
+                raise ValueError("驱动与当前内核不匹配，请为当前内核重新编译并签名驱动")
+            signer = command(["/usr/sbin/modinfo", "-F", "signer", str(module)], capture_output=True, text=True).stdout.strip()
+            if not signer:
+                raise ValueError("模块没有签名；请先完成签名和证书登记")
         target = Path("/lib/modules") / kernel / "updates/fancontrollx/nct6687.ko"
-        unit = render_unit(ROOT, config_path.parent)
+        unit = render_unit(ROOT, config_path.parent, load_nct6687=not args.skip_driver)
         names = [f["name"] for f in config["fans"] if f["autostart"] and f["identified"] and f["channel_id"]]
-        print(f"后台服务：{UNIT}\n驱动安装：{target}\n内核：{kernel}\n签名者：{signer}")
+        print(f"后台服务：{UNIT}")
+        if not args.skip_driver:
+            print(f"驱动安装：{target}\n内核：{kernel}\n签名者：{signer}")
+        else:
+            print("沿用系统已安装的驱动，不安装或加载 NCT6687 模块。")
         print("后台自动控制：" + ("、".join(names) if names else "无（可在网页逐路启用）"))
         if args.dry_run:
             print("\n服务配置预览：\n" + unit)
@@ -123,10 +129,11 @@ def main():
             save_config(backup, raw)
             if UNIT.exists():
                 shutil.copy2(UNIT, UNIT.with_name(f"fancontrollx.service.backup-{stamp}"))
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(module, target)
-            target.chmod(0o644)
-            command(["/usr/sbin/depmod", "-a", kernel])
+            if not args.skip_driver:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(module, target)
+                target.chmod(0o644)
+                command(["/usr/sbin/depmod", "-a", kernel])
             save_config(config_path, config)
             write_unit(UNIT, unit)
             print(f"已备份原配置：{backup}")
