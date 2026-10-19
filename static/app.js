@@ -59,7 +59,7 @@ function render(){
   for(const kind of ['cpu','gpu']){const group=state.sensors.filter(s=>s.kind===kind&&s.value!=null);$(`${kind}-temp`).textContent=connected&&group.length?fmt(Math.max(...group.map(s=>s.value)),1):'—';spark(`${kind}-spark`,kind);}
   const active=Object.values(state.outputs).filter(o=>o.active).length;
   $('service-value').textContent=!connected?'状态未知':state.error?'需要检查':`${active} 路控制中`;
-  $('channel-caption').textContent=connected?`${state.config.fans.length} 个风扇配置 · ${state.channels.length} 个 PWM 通道`:'读数已过期';
+  $('channel-caption').textContent=connected?`${state.config.fans.length} 个风扇配置 · ${state.channels.length} 个控制通道`:'读数已过期';
   $('service-caption').textContent=state.demo?'模拟设备 · 不写入真实硬件':state.background_service?'后台独立调速 · 关闭网页不影响运行':'临时前台服务 · 退出终端将停止';
   $('mode-badge').textContent=state.demo?'演示模式':state.control_allowed?'后台已连接':'监控模式';
   $('release-all').disabled=!editable()||(!active&&!state.identification&&!Object.keys(state.pending_autostart||{}).length);
@@ -69,12 +69,12 @@ function render(){
   if(state.workspace_api!==2)banner='网页已更新，后台仍是旧版本。请重启 fancontrollx 服务后刷新页面；现有配置会保留。';
   else if(state.error)banner=`控制服务需要检查：${state.error}`;
   else if(state.demo)banner='演示模式：这里的操作仅作用于模拟设备，配置与真实设备分开保存。';
-  else if(!state.channels.length)banner='尚未发现 PWM 通道。可先编辑离线配置，再到设备设置中绑定硬件。';
+  else if(!state.channels.length)banner='尚未发现风扇控制通道。可先编辑离线配置，再到设备设置中绑定硬件。';
   $('hardware-banner').classList.toggle('info',!!state.demo&&!state.error&&state.workspace_api===2);$('hardware-banner').hidden=!banner;$('hardware-banner').textContent=banner;
   renderFanCards();renderLibrary();renderDiscovery();renderSensors();renderDiagnostics();updateIdentification();
   if(curveEdit&&curveEdit.dragging===null)drawChart();
 }
-function sourceOptions(f){const value=f.sensor_ids.length===1&&sources.some(s=>s[0]===f.sensor_ids[0])?f.sensor_ids[0]:'@custom';return sources.map(([id,name])=>`<option value="${id}" ${id===value?'selected':''}>${name}</option>`).join('')+`<option value="@custom" ${value==='@custom'?'selected':''}>自定义组合…</option>`;}
+function sourceOptions(f){const choices=[...sources,...state.sensors.filter(s=>s.kind==='gpu').map(s=>[s.id,s.name])];const value=f.sensor_ids.length===1&&choices.some(s=>s[0]===f.sensor_ids[0])?f.sensor_ids[0]:'@custom';return choices.map(([id,name])=>`<option value="${esc(id)}" ${id===value?'selected':''}>${esc(name)}</option>`).join('')+`<option value="@custom" ${value==='@custom'?'selected':''}>自定义组合…</option>`;}
 function curveOptions(f){return `<option value="" ${!f.curve_id?'selected':''}>独立曲线</option>`+(state.config.curves||[]).map(c=>`<option value="${esc(c.id)}" ${f.curve_id===c.id?'selected':''}>${esc(c.name)}</option>`).join('');}
 function renderFanCards(){
   $('fan-count').textContent=state.config.fans.length;
@@ -83,9 +83,10 @@ function renderFanCards(){
   for(const f of state.config.fans){
     const o=state.outputs[f.id]||{},c=state.channels.find(c=>c.id===f.channel_id);
     const requested=state.background_service?f.autostart:!!o.active;
+    const low=Math.max(f.min_duty,c?.min_duty||0),high=Math.max(low,Math.min(f.max_duty,c?.max_duty||100));
     const testing=state.identification?.channel_id===f.channel_id;
     const disabled=!editable()||pendingFans.has(f.id);
-    const signature=JSON.stringify([f,state.config.curves,connected,state.workspace_api,state.control_allowed,state.background_service,c?.writable,c?.name,pendingFans.has(f.id),requested]);
+    const signature=JSON.stringify([f,state.config.curves,connected,state.workspace_api,state.control_allowed,state.background_service,c?.writable,c?.name,low,high,state.sensors.filter(s=>s.kind==='gpu').map(s=>[s.id,s.name]),pendingFans.has(f.id),requested]);
     let el=[...$('fan-cards').children].find(el=>el.dataset.fan===f.id);
     if(!el){el=document.createElement('article');el.className='fan-card';el.dataset.fan=f.id;$('fan-cards').append(el);}
     if(cardSignatures.get(f.id)!==signature&&!editingRanges.has(f.id)){
@@ -94,18 +95,18 @@ function renderFanCards(){
         <div class="fan-values"><div><span class="value-label">当前输出</span><strong data-live="actual">—</strong><small>% 输出</small></div><div class="reading"><span data-live="rpm">—</span> RPM<br><span data-live="temperature">—</span> °C 输入</div></div><div class="progress"><i data-live="progress"></i></div>
         <div class="mode-buttons" role="group" aria-label="${esc(f.name)} 控制方式"><button data-mode="curve" class="${f.mode==='curve'?'selected':''}" aria-pressed="${f.mode==='curve'}" ${disabled?'disabled':''}>温度曲线</button><button data-mode="manual" class="${f.mode==='manual'?'selected':''}" aria-pressed="${f.mode==='manual'}" ${disabled?'disabled':''}>手动调速</button></div>
         <div class="card-fields"><label>温度源<select data-field="source" aria-label="${esc(f.name)} 温度源" ${disabled?'disabled':''}>${sourceOptions(f)}</select></label><label>曲线<select data-field="curve_id" aria-label="${esc(f.name)} 曲线" ${disabled||f.mode==='manual'?'disabled':''}>${curveOptions(f)}</select></label></div>
-        <div class="manual-field" ${f.mode==='manual'?'':'hidden'}><div class="slider-label"><label for="manual-${esc(f.id)}">手动输出</label><output data-live="manual">${fmt(f.manual_duty)}%</output></div><input id="manual-${esc(f.id)}" data-manual type="range" min="${f.min_duty}" max="${f.max_duty}" step="1" value="${Math.max(f.min_duty,Math.min(f.max_duty,f.manual_duty))}" aria-label="${esc(f.name)} 手动输出" ${disabled?'disabled':''}><div class="hint">${fmt(f.min_duty)}–${fmt(f.max_duty)}% · 松开即保存，按升降速限制调整</div></div>
+        <div class="manual-field" ${f.mode==='manual'?'':'hidden'}><div class="slider-label"><label for="manual-${esc(f.id)}">手动输出</label><output data-live="manual">${fmt(Math.max(low,Math.min(high,f.manual_duty)))}%</output></div><input id="manual-${esc(f.id)}" data-manual type="range" min="${low}" max="${high}" step="1" value="${Math.max(low,Math.min(high,f.manual_duty))}" aria-label="${esc(f.name)} 手动输出" ${disabled?'disabled':''}><div class="hint">${fmt(low)}–${fmt(high)}% · 松开即保存，按升降速限制调整</div></div>
         <div class="toolbar card-actions"><button class="text-button" data-edit-curve ${disabled?'disabled':''}>${icon('curve')}编辑曲线</button><button class="text-button" data-device ${disabled?'disabled':''}>${icon('settings')}设置</button>${!f.identified&&c?`<button class="text-button" data-identify="${esc(c.id)}" ${disabled?'disabled':''}>确认设备</button>`:''}</div>
         <div class="card-footer"><label class="control-toggle"><input type="checkbox" data-toggle aria-label="${esc(f.name)} 启用控制" ${requested?'checked':''} ${disabled||!state.control_allowed||(!requested&&(!f.identified||!c?.writable))?'disabled':''}><span>启用控制</span></label><span class="hint" data-live="policy"></span></div><p class="card-feedback" data-live="feedback" role="status"></p>`;
     }
     const live=(key,value)=>{const target=el.querySelector(`[data-live="${key}"]`);if(target)target.textContent=value;};
-    const status=!connected?'连接中断':testing?'测试辨认中':state.pending_autostart?.[f.id]?'等待设备就绪':o.active?(o.fault?'保护运行':'正在控制'):!f.identified?'待确认设备':c?'未启用控制':f.channel_id?'通道离线':'离线配置';
+    const status=!connected?'连接中断':testing?'测试辨认中':state.pending_autostart?.[f.id]?'等待设备就绪':o.active?(o.fault?'保护运行':o.automatic?'显卡自动调速':'正在控制'):!f.identified?'待确认设备':c?'未启用控制':f.channel_id?'通道离线':'离线配置';
     el.classList.toggle('is-active',connected&&!!o.active);el.classList.toggle('has-fault',connected&&!!o.active&&!!o.fault);live('status',status);el.querySelector('[data-live="status"]').className=`status-tag ${connected&&o.active?'active':''} ${connected&&o.fault&&o.active?'fault':''}`;
     live('actual',connected?fmt(o.actual,1):'—');live('rpm',connected?fmt(o.rpm):'—');live('temperature',connected?fmt(o.temperature,1):'—');
     el.querySelector('[data-live="progress"]').style.width=`${connected?Math.max(0,Math.min(100,o.actual||0)):0}%`;
-    live('policy',requested?(state.background_service?'已保存 · 开机恢复':'本次运行有效'):'保持原硬件控制');
+    live('policy',o.active&&o.automatic?'曲线 0% · 显卡自动调速':requested?(state.background_service?'已保存 · 开机恢复':'本次运行有效'):c?.backend==='nvidia'?(c.mode===0?'显卡自动调速':'显卡原手动模式'):'保持原硬件控制');
     const message=cardMessages.get(f.id);const fault=connected&&o.active?o.fault:null;
-    live('feedback',!connected?'读数已过期':pendingFans.has(f.id)?'正在应用…':fault||state.pending_autostart?.[f.id]||message?.text||(o.active?`目标 ${fmt(o.requested??o.target,1)}% · ${Math.abs((o.requested??o.target)-o.target)>1?'正在平滑调整':'已自动保存'}`:'设置已保存，启用控制后应用'));
+    live('feedback',!connected?'读数已过期':pendingFans.has(f.id)?'正在应用…':fault||state.pending_autostart?.[f.id]||(o.active&&o.automatic?'由显卡决定转速与停转；曲线升高后自动接管':message?.text)||(o.active?`目标 ${fmt(o.requested??o.target,1)}% · ${Math.abs((o.requested??o.target)-o.target)>1?'正在平滑调整':'已自动保存'}`:'设置已保存，启用控制后应用'));
     el.querySelector('[data-live="feedback"]').classList.toggle('error',!!fault||!!message?.error);
   }
   if(!ids.size)$('fan-cards').innerHTML='<div class="empty">还没有风扇配置。<br><button class="button secondary" data-tab="devices">前往设备设置</button></div>';
@@ -116,18 +117,18 @@ function renderLibrary(){
   $('curve-library').innerHTML=(state.config.curves||[]).map(c=>{const users=state.config.fans.filter(f=>f.curve_id===c.id);return `<article class="curve-card"><h3>${esc(c.name)}</h3>${miniCurve(c.points)}<p>${users.length?`用于 ${esc(users.map(f=>f.name).join('、'))}`:'尚未分配给风扇'} · ${c.points.length} 个节点</p><div class="toolbar"><button class="text-button" data-library-edit="${esc(c.id)}" ${!editable()?'disabled':''}>编辑</button><button class="text-button" data-library-copy="${esc(c.id)}" ${!editable()?'disabled':''}>复制</button><button class="text-button danger" data-library-delete="${esc(c.id)}" ${!editable()||users.length?'disabled':''} title="${users.length?'请先更换引用此曲线的风扇所用曲线':'删除未使用的曲线'}">删除</button></div></article>`;}).join('')||`<div class="empty curve-empty"><span class="empty-icon">${icon('curve')}</span><div><h3>从一条好曲线开始</h3><p>新建共享曲线，或将风扇的独立曲线保存到这里。</p></div><button class="button secondary" data-create-curve ${!editable()?'disabled':''}>${icon('plus')}创建第一条曲线</button></div>`;
 }
 function renderDiscovery(){
-  const devices=state.discovery||[];const pending=devices.filter(c=>c.connection!=='rotating'&&!c.identified);
-  $('discovery-summary').textContent=`${devices.filter(c=>c.connection==='rotating').length} 路有转速信号 · ${devices.filter(c=>c.identified).length} 路已确认 · ${pending.length} 路待确认`;
+  const devices=state.discovery||[];const pending=devices.filter(c=>c.connection==='unconfirmed'&&!c.identified);
+  $('discovery-summary').textContent=`${devices.filter(c=>c.connection==='rotating').length} 路有转速信号 · ${devices.filter(c=>c.backend==='nvidia').length} 路显卡风扇 · ${devices.filter(c=>c.identified).length} 路已确认 · ${pending.length} 路待确认`;
   const signature=JSON.stringify([devices.map(c=>[c.id,c.display_name,c.identified,c.writable,c.connection]),editable()]);
   if(discoverySignature!==signature){discoverySignature=signature;
     const card=c=>`<article class="discovery-card" data-channel="${esc(c.id)}"><div class="card-top"><span class="fan-symbol">${icon('fan')}</span><div class="card-name"><h3>${esc(c.display_name)}</h3><div class="chip-label">${esc(c.chip)} · ${esc(c.name)} · ${esc(c.id.split('/').at(-1))}</div></div><span class="badge">${c.identified?'已确认':'待确认'}</span></div><div class="discovery-readings"><strong data-rpm>—</strong><span data-duty>—</span></div><div class="toolbar"><button class="button secondary" data-identify="${esc(c.id)}" ${!editable()?'disabled':''}>${c.identified?'辨认 / 改名':'确认设备'}</button>${c.fan_id?`<button class="text-button" data-device-id="${esc(c.fan_id)}" ${!editable()?'disabled':''}>绑定与设置</button>`:''}</div></article>`;
-    $('discovered-fans').innerHTML=devices.filter(c=>!pending.includes(c)).map(card).join('')||'<div class="empty">没有正在旋转或已确认的设备，请检查驱动或下方通道。</div>';
+    $('discovered-fans').innerHTML=devices.filter(c=>!pending.includes(c)).map(card).join('')||'<div class="empty">没有已识别的在线设备，请检查驱动或下方通道。</div>';
     $('unconfirmed-fans').innerHTML=pending.map(card).join('');$('unconfirmed-channels').hidden=!pending.length;$('unconfirmed-summary').textContent=`其他待确认通道 · ${pending.length}`;
   }
   for(const el of document.querySelectorAll('[data-channel]')){const c=devices.find(c=>c.id===el.dataset.channel);el.querySelector('[data-rpm]').textContent=`${connected?fmt(c?.rpm):'—'} RPM`;el.querySelector('[data-duty]').textContent=`${connected?fmt(c?.duty,1):'—'}% 硬件输出`;}
 }
 function renderSensors(){$('sensor-table').innerHTML=[...state.sensors.map(s=>`<tr><td>${esc(s.name)}</td><td>${esc(s.chip)}</td><td>${s.kind==='cpu'?'CPU':s.kind==='gpu'?'GPU':'温度'}</td><td>${connected?fmt(s.value,1):'—'} °C</td></tr>`),...state.fans.map(f=>`<tr><td>${esc(f.name)}</td><td>${esc(f.chip)}</td><td>转速</td><td>${connected?fmt(f.rpm):'—'} RPM</td></tr>`)].join('');}
-function renderDiagnostics(){const row=(name,value)=>`<div class="diagnostic-row"><span>${esc(name)}</span><span>${esc(value)}</span></div>`;$('diagnostics-content').innerHTML=`<article class="panel diagnostic-card"><h3>本机服务</h3>${row('运行方式',state.background_service?'systemd 后台服务':'临时前台')}${row('硬件写入',state.control_allowed?'已允许':'仅监控')}${row('GPU 温度',state.gpu_error||'正常')}${row('配置格式',`v${state.config.version}`)}${row('配置文件',state.demo?'data/config.demo.json':'data/config.json')}<p class="hint">首次升级保存前自动备份旧配置。更新代码后需重启服务；关闭网页不会停止后台调速。</p></article><article class="panel diagnostic-card"><h3>PWM 通道</h3>${state.channels.map(c=>row(`${c.chip} · ${c.name}`,c.reason||`${fmt(c.duty,1)}% · ${c.watchdog?'硬件看门狗':'无硬件看门狗'}`)).join('')||'<p class="hint">未检测到可用通道</p>'}</article><article class="panel diagnostic-card"><h3>维护</h3><p class="hint">查看状态：<code>systemctl status fancontrollx</code><br>更新后重启：<code>sudo systemctl restart fancontrollx</code><br>查看日志：<code>sudo journalctl -u fancontrollx -n 50 --no-pager</code></p></article>`;$('event-list').innerHTML=state.events.map(e=>`<div class="event-row"><time>${new Date(e.time*1000).toLocaleTimeString('zh-CN',{hour12:false})}</time><span>${esc(e.message)}</span></div>`).join('')||'<p class="hint">暂无运行事件</p>';}
+function renderDiagnostics(){const row=(name,value)=>`<div class="diagnostic-row"><span>${esc(name)}</span><span>${esc(value)}</span></div>`;$('diagnostics-content').innerHTML=`<article class="panel diagnostic-card"><h3>本机服务</h3>${row('运行方式',state.background_service?'systemd 后台服务':'临时前台')}${row('硬件写入',state.control_allowed?'已允许':'仅监控')}${row('GPU 温度',state.gpu_error||'正常')}${row('NVIDIA 风扇接口',state.gpu_control_error||'正常')}${row('配置格式',`v${state.config.version}`)}${row('配置文件',state.demo?'data/config.demo.json':'data/config.json')}<p class="hint">首次升级保存前自动备份旧配置。更新代码后需重启服务；关闭网页不会停止后台调速。</p></article><article class="panel diagnostic-card"><h3>风扇控制通道</h3>${state.channels.map(c=>row(`${c.chip} · ${c.name}`,c.reason||`${fmt(c.duty,1)}% · ${c.watchdog?'硬件看门狗':c.software_watchdog?'独立进程守护':'无硬件看门狗'}`)).join('')||'<p class="hint">未检测到可用通道</p>'}</article><article class="panel diagnostic-card"><h3>维护</h3><p class="hint">查看状态：<code>systemctl status fancontrollx</code><br>更新后重启：<code>sudo systemctl restart fancontrollx</code><br>查看日志：<code>sudo journalctl -u fancontrollx -n 50 --no-pager</code></p></article>`;$('event-list').innerHTML=state.events.map(e=>`<div class="event-row"><time>${new Date(e.time*1000).toLocaleTimeString('zh-CN',{hour12:false})}</time><span>${esc(e.message)}</span></div>`).join('')||'<p class="hint">暂无运行事件</p>';}
 async function changeFan(id,changes){
   if(!editable()||pendingFans.has(id))return;const f=findFan(id);const expected=Object.fromEntries(Object.keys(changes).map(k=>[k,clone(f[k])]));pendingFans.add(id);cardMessages.delete(id);renderFanCards();
   try{await api('/api/fan',{id,changes,expected});cardMessages.set(id,{text:'已自动保存并应用'});await refresh();}
@@ -142,6 +143,7 @@ function openCurve({fanId=null,curveId=null,copy=false}={}){
   $('curve-title').textContent=copy?'复制曲线':curve?'编辑共享曲线':f?'编辑风扇曲线':'新建曲线';$('curve-name').value=curveEdit.name;$('curve-share').checked=false;$('share-choice').hidden=!!curve||!f;$('curve-name').disabled=!curve&&!!f;
   const users=curve&&!copy?state.config.fans.filter(f=>f.curve_id===curve.id):[];
   $('curve-context').textContent=users.length?`应用后更新 ${users.length} 个风扇：${users.map(f=>f.name).join('、')}。各自的温度源保持不变。`:f?'此处只编辑曲线形状，温度源在风扇卡片中选择。':'保存后可在任意风扇卡片中选择这条曲线。';
+  $('curve-behavior-help').textContent=state.channels.some(c=>c.curve_zero_auto)?'预览不会改变风速。NVIDIA 曲线为 0% 时交回显卡自动模式，是否停转由显卡决定；正值按最低输出限制调速。应用后生效。':'预览不会改变风速。应用后，正在使用此曲线的风扇会按各自的限制和平滑设置调整。';
   $('preset').value='custom';errorIn('curve-error','');renderPoints();drawChart();showDialog('curve-dialog');
 }
 const chart={left:58,right:770,top:22,bottom:291};
@@ -159,7 +161,8 @@ function drawChart(){
   // Keep focused graph nodes stable between polling updates and keyboard steps.
   const focus=$('curve-chart').contains(document.activeElement)?document.activeElement.dataset.node:null;
   $('curve-chart').innerHTML=html;if(focus!=null)$('curve-chart').querySelector(`[data-node="${focus}"]`)?.focus({preventScroll:true});
-  $('chart-current').textContent=f?(connected&&temp!=null?`${fmt(temp,1)}°C · 曲线预览 ${fmt(interpolate(curveEdit.points,temp),1)}%`:'温度源不可用'):'曲线预览';
+  const zeroAuto=f&&temp!=null&&state.channels.find(c=>c.id===f.channel_id)?.curve_zero_auto&&interpolate(curveEdit.points,temp)===0;
+  $('chart-current').textContent=f?(connected&&temp!=null?`${fmt(temp,1)}°C · 曲线预览 ${fmt(interpolate(curveEdit.points,temp),1)}%${zeroAuto?' → 显卡自动模式':''}`:'温度源不可用'):'曲线预览';
 }
 function renderPoints(){$('point-count').textContent=`${curveEdit.points.length} 个节点`;$('point-list').innerHTML=curveEdit.points.map((p,i)=>`<div class="point ${i===curveEdit.selected?'selected':''}"><div class="point-top"><span>节点 ${i+1}</span><button type="button" data-remove-point="${i}" aria-label="删除节点 ${i+1}" ${curveEdit.points.length<=2?'disabled':''}>×</button></div><div class="point-values"><label>温度 °C<input type="number" value="${p[0]}" min="-20" max="120" step="1" data-point="${i}" data-axis="0" aria-label="节点 ${i+1} 温度"></label><span>→</span><label>输出 %<input type="number" value="${p[1]}" min="0" max="100" step="1" data-point="${i}" data-axis="1" aria-label="节点 ${i+1} 输出"></label></div></div>`).join('');}
 function setPoint(i,t,d){const p=curveEdit.points;const low=i?p[i-1][0]+1:-20,high=i<p.length-1?p[i+1][0]-1:120;p[i]=[Math.round(Math.max(low,Math.min(high,t))),Math.round(Math.max(0,Math.min(100,d)))];curveEdit.selected=i;curveEdit.dirty=true;$('preset').value='custom';drawChart();}
@@ -170,10 +173,13 @@ function openDevice(id,mix=false){
   if(!editable())return;const f=findFan(id);if(!f)return;deviceEdit={id,base:clone(f),dirty:false,mixChanged:false};
   $('fan-name').value=f.name;$('channel-select').innerHTML=options(state.channels,f.channel_id,'暂不绑定');$('channel-select').value=f.channel_id||'';$('rpm-select').innerHTML=options(state.fans,f.rpm_sensor_id,'不绑定测速');$('rpm-select').value=f.rpm_sensor_id||'';
   for(const [id,key] of Object.entries(numericFields))$(id).value=f[key];
+  updateDeviceLimits();
   const sensors=[{id:'@cpu',name:'CPU'},{id:'@gpu',name:'GPU'},{id:'@cpu-gpu',name:'CPU / GPU 取大'},...state.sensors];for(const id of f.sensor_ids)if(!sensors.some(s=>s.id===id))sensors.push({id,name:`离线：${id}`});
   $('sensor-checkboxes').innerHTML=sensors.map(s=>`<label class="checkbox"><input type="checkbox" value="${esc(s.id)}" ${f.sensor_ids.includes(s.id)?'checked':''}>${esc(s.chip?`${s.chip} · ${s.name}`:s.name)}</label>`).join('');$('aggregation').value=f.aggregation;$('mix-details').open=mix;errorIn('device-error','');showDialog('device-dialog');
 }
-function openIdentification(id){if(!editable())return;const c=state.discovery.find(c=>c.id===id);if(!c)return;identifyingChannel=id;$('identify-title').textContent=c.identified?'辨认与命名':'确认设备';$('identify-channel').textContent=`${c.chip} · ${c.name} · ${c.id.split('/').at(-1)}`;$('identify-name').value=c.display_name;$('identify-kind').value=c.device_kind;$('identify-slider').value=100;errorIn('identify-error','');identificationKindChanged();updateIdentification();showDialog('identify-dialog');}
+function updateDeviceLimits(){const c=state.channels.find(c=>c.id===$('channel-select').value);const gpu=c?.backend==='nvidia';for(const id of ['min-duty','max-duty']){$(id).min=gpu?c.min_duty:20;$(id).max=gpu?c.max_duty:100;}$('device-hardware-help').textContent=gpu?`显卡手动范围 ${c.min_duty}–${c.max_duty}%。${c.curve_zero_auto?'曲线为 0% 时交回显卡自动模式，是否停转由显卡决定。':'不支持手动停转。'}关闭控制可恢复接管前模式。显卡自身达到 85°C 或温度丢失时强制保护。RPM 为驱动报告值，不作为物理停转故障依据。`:'更换控制通道后，需要重新确认设备。测速通道按实际接线配对。';}
+$('channel-select').addEventListener('change',updateDeviceLimits);
+function openIdentification(id){if(!editable())return;const c=state.discovery.find(c=>c.id===id);if(!c)return;identifyingChannel=id;$('identify-title').textContent=c.identified?'辨认与命名':'确认设备';$('identify-channel').textContent=`${c.chip} · ${c.name} · ${c.id.split('/').at(-1)}`;$('identify-name').value=c.display_name;$('identify-kind').value=c.backend==='nvidia'?'fan':c.device_kind;$('identify-kind').disabled=c.backend==='nvidia';$('identify-slider').value=100;errorIn('identify-error','');identificationKindChanged();updateIdentification();showDialog('identify-dialog');}
 function identificationKindChanged(){const c=state.discovery.find(c=>c.id===identifyingChannel);const kind=$('identify-kind').value;const pump=kind==='pump'||(c?.name.toLowerCase().includes('pump')&&kind!=='fan');$('identify-slider').min=pump?100:50;if(pump)$('identify-slider').value=100;$('identify-output').textContent=`${$('identify-slider').value}%`;$('identify-pump-help').hidden=!pump;}
 function updateIdentification(){if(!identifyingChannel)return;const c=state.discovery.find(c=>c.id===identifyingChannel),test=state.identification?.channel_id===identifyingChannel?state.identification:null;$('identify-rpm').textContent=connected?fmt(c?.rpm):'—';$('identify-hardware-duty').textContent=connected?fmt(c?.duty,1):'—';const canTest=editable()&&state.control_allowed&&c?.writable;for(const id of ['identify-full','identify-apply','identify-slider'])$(id).disabled=!canTest||identifyBusy;$('identify-stop').disabled=!editable()||!test||identifyBusy;$('identify-save').disabled=!editable()||identifyBusy;$('identify-test-status').textContent=!connected?'连接中断，等待测试超时恢复':test?.stopping?'恢复状态失败，后台正在重试':test?`${test.fault||`正在以 ${fmt(test.effective_duty)}% 测试`} · ${test.remaining_s} 秒后结束`:!canTest?'当前不能写入硬件；仍可确认名称和设备类型':'测试未运行，保持此前控制模式';}
 async function identify(duty){if(identifyBusy)return;identifyBusy=true;updateIdentification();try{await api('/api/identify',{channel_id:identifyingChannel,duty,device_kind:$('identify-kind').value});await refresh();errorIn('identify-error','');}catch(error){errorIn('identify-error',error.message);}finally{identifyBusy=false;updateIdentification();}}
