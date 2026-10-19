@@ -204,9 +204,60 @@ try{
     const editor=await send('Page.captureScreenshot',{format:'png'});
     await writeFile('test-results/demo-mobile-editor.png',Buffer.from(editor.data,'base64'));
     await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
+    // UI-only NVIDIA fixture. API polling reads this snapshot; no synthetic
+    // GPU operation is submitted to the backend and no real hardware is used.
+    await evaluate(`(async()=>{
+      const snapshot=await(await fetch('/api/state')).json(),sensor='nvidia/GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',channel=sensor+'/fan0';
+      const f={...structuredClone(snapshot.config.fans[0]),id:'browser-nvidia',name:'显卡风扇 1',channel_id:channel,rpm_sensor_id:channel+'/rpm',sensor_ids:[sensor],mode:'manual',manual_duty:20,min_duty:20,max_duty:100,identified:false,device_kind:'unknown',autostart:false,curve_id:null};
+      const c={id:channel,name:'NVIDIA RTX <test> · 风扇 1',chip:'nvidia',backend:'nvidia',duty:0,mode:0,writable:true,present:true,min_duty:30,max_duty:100,software_watchdog:true,curve_zero_auto:true,temperature_sensor_id:sensor,rpm_sensor_id:channel+'/rpm'};
+      snapshot.sensors.push({id:sensor,name:'NVIDIA RTX <test>',chip:'nvidia',kind:'gpu',value:40});
+      snapshot.config.fans.push(f);snapshot.channels.push(c);snapshot.fans.push({id:channel+'/rpm',name:c.name,chip:'nvidia',rpm:0});
+      snapshot.discovery.push({...c,connection:'present',rpm:0,fan_id:f.id,identified:false,device_kind:'unknown',display_name:f.name});
+      snapshot.outputs[f.id]={actual:0,target:30,requested:20,rpm:0,temperature:40,active:false,fault:null};
+      const original=window.fetch.bind(window);window.fetch=(url,...args)=>String(url).split('?')[0]==='/api/state'?Promise.resolve(new Response(JSON.stringify(snapshot),{headers:{'Content-Type':'application/json'}})):original(url,...args);
+      window.nvidiaFixture=snapshot;
+      document.querySelector('nav [data-tab="devices"]').click();
+    })()`);
+    await waitFor(`document.querySelector('[data-fan="browser-nvidia"]')!==null`);
+    assert.equal(await evaluate(`document.querySelector('#discovered-fans [data-channel^="nvidia/"]')!==null`),true,'Zero RPM GPU must be visible among online devices');
+    await evaluate(`document.querySelector('nav [data-tab="control"]').click()`);
+    const gpuCard=`document.querySelector('[data-fan="browser-nvidia"]')`;
+    assert.equal(await evaluate(`${gpuCard}.querySelector('[data-manual]').min`),'30','GPU slider respects driver minimum');
+    assert.equal(await evaluate(`${gpuCard}.querySelector('[data-live="manual"]').textContent`),'30%','Manual output label agrees with clamped slider');
+    assert.equal(await evaluate(`${gpuCard}.querySelector('[data-field="source"]').selectedOptions[0].textContent`),'NVIDIA RTX <test>','GPU source names render as text');
+    assert.equal(await evaluate(`${gpuCard}.querySelector('[data-live="policy"]').textContent`),'显卡自动调速');
+    await evaluate(`${gpuCard}.querySelector('[data-device]').click()`);
+    assert.equal(await evaluate(`document.getElementById('min-duty').min`),'30');
+    assert.equal(await evaluate(`document.getElementById('device-hardware-help').textContent.includes('30–100%')`),true);
+    await evaluate(`document.querySelector('#device-dialog [data-close]').click();${gpuCard}.querySelector('[data-identify]').click()`);
+    assert.equal(await evaluate(`document.getElementById('identify-kind').value`),'fan');
+    assert.equal(await evaluate(`document.getElementById('identify-kind').disabled`),true);
+    await evaluate(`document.getElementById('identify-close').click()`);
+    await evaluate(`(()=>{const s=window.nvidiaFixture,f=s.config.fans.find(f=>f.id==='browser-nvidia');f.mode='curve';f.identified=true;f.autostart=true;f.device_kind='fan';f.points=[[25,0],[45,0],[55,50],[85,100]];Object.assign(s.outputs[f.id],{actual:37,rpm:740,target:0,requested:0,automatic:true,active:true});})()`);
+    await waitFor(`${gpuCard}.querySelector('[data-live="status"]').textContent==='显卡自动调速'`);
+    assert.equal(await evaluate(`${gpuCard}.querySelector('[data-live="policy"]').textContent.includes('曲线 0%')`),true);
+    assert.equal(await evaluate(`${gpuCard}.querySelector('[data-live="actual"]').textContent`),'37','Native mode still shows real reported output');
+    assert.equal(await evaluate(`${gpuCard}.querySelector('[data-toggle]').checked`),true,'Automatic delegation retains enabled policy');
+    assert.equal(await evaluate(`${gpuCard}.querySelector('[data-live="feedback"]').textContent.includes('由显卡决定')`),true);
+    await evaluate(`${gpuCard}.querySelector('[data-edit-curve]').click()`);
+    assert.equal(await evaluate(`document.getElementById('curve-behavior-help').textContent.includes('0%')`),true);
+    assert.equal(await evaluate(`document.getElementById('chart-current').textContent.includes('显卡自动模式')`),true);
+    await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
+    await evaluate(`Object.assign(window.nvidiaFixture.outputs['browser-nvidia'],{automatic:false,target:100,requested:100,actual:100,fault:'显卡自身温度异常，使用最大输出'})`);
+    await waitFor(`${gpuCard}.querySelector('[data-live="status"]').textContent==='保护运行'`);
+    assert.equal(await evaluate(`${gpuCard}.querySelector('[data-live="feedback"]').textContent.includes('温度异常')`),true);
+    await evaluate(`Object.assign(window.nvidiaFixture.outputs['browser-nvidia'],{automatic:true,target:0,requested:0,actual:37,fault:null})`);
+    await waitFor(`${gpuCard}.querySelector('[data-live="status"]').textContent==='显卡自动调速'`);
+    for(const width of [320,1440]){
+      await send('Emulation.setDeviceMetricsOverride',{width,height:1000,deviceScaleFactor:1,mobile:width<580});
+      assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'),true,`NVIDIA layout overflow at ${width}px`);
+    }
+    const gpuScreenshot=await fullScreenshot();
+    await writeFile('test-results/demo-nvidia-desktop.png',Buffer.from(gpuScreenshot.data,'base64'));
+    await reloadPage();
   }
   assert.deepEqual(errors,[],'Browser JavaScript exceptions');
-  console.log(`PASS: ${snapshotOnly?'read-only telemetry and responsive layout':'identification and restoration, independent sources, shared curves, drag/cancel/apply, manual slider, control switch, settings, offline CRUD, curve copy/delete, edit conflict, reload and desktop/mobile layouts'}; theme persistence and 320/768/1024px navigation layouts`);
+  console.log(`PASS: ${snapshotOnly?'read-only telemetry and responsive layout':'identification and restoration, independent sources, shared curves, drag/cancel/apply, manual slider, control switch, settings, offline CRUD, curve copy/delete, edit conflict, reload and desktop/mobile layouts'}; theme persistence and 320/768/1024px navigation layouts${snapshotOnly?'':'; NVIDIA zero RPM discovery, source selection, driver bounds, zero-curve automatic status and protection'}`);
 }finally{
   socket?.close();
   browser.kill('SIGTERM');
