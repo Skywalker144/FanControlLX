@@ -183,7 +183,7 @@ class Engine:
                     channel = lookup.get(test["channel_id"])
                     if channel is None or not channel["writable"]:
                         raise OSError("识别通道离线或不可写")
-                    duty, fault = self.identification_duty(test["duty"], sensors)
+                    duty, fault = self.identification_duty(test["duty"], sensors, channel)
                     self.hardware.write(test["channel_id"], duty)
                     test["effective_duty"], test["fault"] = duty, fault
                 except (OSError, KeyError):
@@ -191,6 +191,7 @@ class Engine:
                     raise
             outputs = {}
             for f in self.config["fans"]:
+                channel = lookup.get(f["channel_id"])
                 values = source_values(f["sensor_ids"], sensors)
                 raw = None if values is None else (sum(values) / len(values) if f["aggregation"] == "average"
                                                    else (min(values) if f["aggregation"] == "min" else max(values)))
@@ -204,6 +205,7 @@ class Engine:
                 smoothed = sum(x[1] for x in samples) / len(samples) if samples and raw is not None else raw
                 fault = None
                 requested = None
+                automatic = False
                 # Emergency threshold sees the hottest RAW input, bypassing averaging and all delays.
                 if values is None:
                     duty, fault = 100, "温度源不可用，保护输出 100%"
@@ -217,30 +219,65 @@ class Engine:
                         memory["temp"] = effective
                     points = next((c["points"] for c in self.config["curves"] if c["id"] == f["curve_id"]), f["points"])
                     duty = f["manual_duty"] if f["mode"] == "manual" else interpolate(points, effective)
-                    duty = max(f["min_duty"], min(f["max_duty"], duty))
+                    automatic = bool(channel and channel.get("curve_zero_auto") and f["mode"] == "curve" and duty == 0)
+                    if not automatic:
+                        duty = max(f["min_duty"], min(f["max_duty"], duty))
                     requested = duty
                     previous = memory["duty"]
-                    if previous is not None:
+                    # Zero is a policy change, not a manual speed to approach.
+                    # Ramping towards it would get stuck at the driver's floor.
+                    if automatic:
+                        if previous != 0:
+                            memory["changed_at"] = now
+                    elif previous is not None:
+                        if channel and channel.get("curve_zero_auto") and previous == 0:
+                            # Leaving automatic control starts at a valid
+                            # running output, rather than ramping through zero.
+                            previous = max(f["min_duty"], channel.get("min_duty", 0))
                         if f["mode"] != "manual" and now - memory["changed_at"] < f["response_s"]:
                             duty = previous
                         dt = max(0, min(5, now - memory["last_time"]))
                         duty = max(previous - f["step_down"] * dt, min(previous + f["step_up"] * dt, duty))
                         if abs(duty - previous) >= .1:
                             memory["changed_at"] = now
+                # A GPU must protect itself even when its curve follows CPU or
+                # another custom source. Never average away its own hot input.
+                if channel and channel.get("temperature_sensor_id"):
+                    own = source_values([channel["temperature_sensor_id"]], sensors)
+                    if own is None:
+                        duty, fault = 100, "显卡自身温度不可用，保护输出 100%"
+                    elif max(own) >= min(85, f["critical_temp"]):
+                        duty, fault = 100, "显卡达到保护温度，输出 100%"
                 tach = rpm.get(f["rpm_sensor_id"])
                 active_since = memory.get("active_since", now)
-                if f["id"] in self.enabled and now - active_since > 10 and f["rpm_sensor_id"] and (tach is None or tach <= 0):
+                tach_sensor = next((s for s in fans if s["id"] == f["rpm_sensor_id"]), {})
+                if (f["id"] in self.enabled and now - active_since > 10 and f["rpm_sensor_id"]
+                        and tach_sensor.get("rpm_is_feedback", True) and (tach is None or tach <= 0)):
                     duty, fault = 100, "测速信号丢失或风扇停转，保护输出 100%"
                     requested = 100
+                if fault:
+                    automatic = False
+                if channel and not automatic:
+                    duty = max(channel.get("min_duty", 0), min(channel.get("max_duty", 100), duty))
+                    if requested is not None:
+                        requested = max(channel.get("min_duty", 0), min(channel.get("max_duty", 100), requested))
+                if fault:
+                    requested = duty
                 memory["last_time"], memory["duty"] = now, duty
-                channel = lookup.get(f["channel_id"])
                 status = "待绑定通道" if not f["channel_id"] else ("通道离线" if channel is None else "未接管")
                 if f["id"] in self.enabled:
                     try:
                         if channel is None or not channel["writable"]:
-                            raise OSError("PWM 通道离线或不可写")
-                        self.hardware.write(f["channel_id"], duty)
-                        status = "保护运行" if fault else "正在控制"
+                            raise OSError("控制通道离线或不可写")
+                        result = self.hardware.write(f["channel_id"], duty)
+                        if isinstance(result, dict) and result.get("fault"):
+                            # The independent writer can observe a new GPU
+                            # fault after this cycle's telemetry was sampled.
+                            automatic = False
+                            duty = requested = result["duty"]
+                            memory["duty"] = duty
+                            fault = fault or result["fault"]
+                        status = "保护运行" if fault else "显卡自动调速" if automatic else "正在控制"
                     except (OSError, KeyError) as exc:
                         self.release(f["id"])
                         if self.managed and f["autostart"]:
@@ -253,6 +290,7 @@ class Engine:
                                       "target": round(duty, 1), "rpm": tach, "status": status,
                                       "requested": round(requested if requested is not None else duty, 1),
                                       "actual": channel.get("duty") if channel else None,
+                                      "automatic": automatic,
                                       "active": f["id"] in self.enabled, "fault": fault}
             self.snapshot = {"sensors": sensors, "fans": fans, "channels": channels,
                              "chips": chips, "outputs": outputs}
@@ -277,6 +315,7 @@ class Engine:
                                   "events": list(self.events), "demo": self.demo,
                                   "control_allowed": self.allow_control, "error": self.error,
                                   "gpu_error": self.hardware.gpu_error, "time": time.time(),
+                                  "gpu_control_error": getattr(self.hardware, "gpu_control_error", None),
                                   "discovery": self.discovery(), "identification": identification,
                                   "background_service": self.managed,
                                   "config_revision": self.config_revision(),
@@ -293,7 +332,8 @@ class Engine:
             tach = tachometers.get(rpm_id, {})
             rpm = tach.get("rpm")
             result.append({**channel, "rpm_sensor_id": rpm_id, "rpm": rpm,
-                           "connection": "rotating" if rpm is not None and rpm > 0 else "unconfirmed",
+                           "connection": "rotating" if rpm is not None and rpm > 0 else
+                                         "present" if channel.get("present") else "unconfirmed",
                            "fan_id": bound["id"] if bound else None,
                            "display_name": bound["name"] if bound else channel["name"],
                            "identified": bound["identified"] if bound else False,
@@ -303,8 +343,10 @@ class Engine:
     def discovered_fan(self, channel):
         id_ = "fan-" + hashlib.sha256(channel["id"].encode()).hexdigest()[:16]
         # Hardware names never determine which temperature a user should follow.
-        f = default_fan(id_, channel["name"])
+        f = default_fan(id_, channel["name"], channel.get("temperature_sensor_id", "@cpu"))
         f.update(channel_id=channel["id"], rpm_sensor_id=channel.get("rpm_sensor_id"))
+        if channel.get("backend") == "nvidia":
+            f.update(min_duty=channel["min_duty"], max_duty=channel["max_duty"])
         return f
 
     def scan_connected(self, persist=True):
@@ -318,7 +360,7 @@ class Engine:
             bound = {f["channel_id"] for f in config["fans"]}
             added = 0
             for candidate in self.discovery():
-                if candidate["connection"] == "rotating" and candidate["id"] not in bound:
+                if candidate["connection"] in ("rotating", "present") and candidate["id"] not in bound:
                     if len(config["fans"]) >= 64:
                         break
                     f = self.discovered_fan(candidate)
@@ -334,11 +376,16 @@ class Engine:
             self.config = config
             self.tick()
             if persist:
-                self.event(f"扫描完成，新增 {added} 个有测速信号的设备；未启用新的控制")
+                self.event(f"扫描完成，新增 {added} 个在线设备；未启用新的控制")
             return added
 
     @staticmethod
-    def identification_duty(duty, sensors):
+    def identification_duty(duty, sensors, channel=None):
+        if channel and channel.get("temperature_sensor_id"):
+            own = source_values([channel["temperature_sensor_id"]], sensors)
+            if own is None or max(own) >= 85:
+                return 100, "显卡温度异常，识别测试保持 100%"
+            return duty, None
         cpu = source_values(["@cpu"], sensors)
         readings = [s["value"] for s in sensors if s["kind"] in ("cpu", "gpu") and s["value"] is not None]
         if cpu is None or (readings and max(readings) >= 85):
@@ -364,7 +411,7 @@ class Engine:
             # Finish a previous test before taking a different channel.
             if self.identification and self.identification["channel_id"] != channel_id:
                 self.stop_identification()
-            effective, fault = self.identification_duty(duty, self.snapshot["sensors"])
+            effective, fault = self.identification_duty(duty, self.snapshot["sensors"], channel)
             if self.identification is None:
                 active = next((f["id"] for f in self.config["fans"]
                                if f["channel_id"] == channel_id and f["id"] in self.enabled), None)
@@ -431,6 +478,8 @@ class Engine:
             candidate = next((c for c in self.discovery() if c["id"] == channel_id), None)
             if candidate is None:
                 raise ValueError("通道不存在或已离线")
+            if candidate.get("backend") == "nvidia" and device_kind != "fan":
+                raise ValueError("NVIDIA 显卡通道只能确认为风扇")
             config = copy.deepcopy(self.config)
             f = next((f for f in config["fans"] if f["channel_id"] == channel_id), None)
             if f is None:
@@ -550,14 +599,17 @@ class Engine:
             self.tick()
             channel = next((c for c in self.snapshot["channels"] if c["id"] == f["channel_id"]), None)
             if channel is None:
-                raise ValueError("请先绑定一个在线 PWM 通道")
+                raise ValueError("请先绑定一个在线控制通道")
             if not channel["writable"]:
                 raise ValueError(channel["reason"])
-            lease = self.hardware.acquire(f["channel_id"], 100)
+            # A zero curve should retain native automatic control without a
+            # needless full-speed pulse when enabling or restarting control.
+            initial = 0 if self.snapshot["outputs"][id_]["automatic"] else 100
+            lease = self.hardware.acquire(f["channel_id"], initial)
             self.leases[id_] = lease
             self.enabled.add(id_)
             self.memory[id_]["active_since"] = time.monotonic()
-            self.memory[id_]["duty"] = 100
+            self.memory[id_]["duty"] = initial
             self.event(f"已接管 {f['name']}")
             self.tick()
 
@@ -603,4 +655,9 @@ class Engine:
         if self.thread:
             self.thread.join(timeout=6)
         with self.lock:
-            self.release_all()
+            try:
+                self.release_all()
+            finally:
+                close = getattr(self.hardware, "close", None)
+                if close:
+                    close()
