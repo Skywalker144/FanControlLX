@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from fancontrollx.config import default_config, default_fan, validate_config
-from fancontrollx.engine import Engine, interpolate, source_values
+from fancontrollx.config import default_config, default_fan, save_config, validate_config
+from fancontrollx.engine import ConfigConflict, Engine, interpolate, source_values
 from fancontrollx.hardware import DemoHardware, Hardware
 from fancontrollx.server import Server
 from fancontrollx.install_service import prepare_config
@@ -79,10 +79,13 @@ class CoreTests(unittest.TestCase):
         self.engine.release(self.cpu_id)
         self.assertEqual(self.hw.duties["demo/pwm1"], original)
 
-    def test_saving_releases_and_restart_does_not_resume(self):
+    def test_saving_retains_control_but_foreground_restart_does_not_resume(self):
         self.engine.activate(self.cpu_id)
+        lease = self.engine.leases[self.cpu_id]
         self.engine.update_config(self.engine.config)
-        self.assertFalse(self.engine.enabled)
+        self.assertIn(self.cpu_id, self.engine.enabled)
+        self.assertIs(self.engine.leases[self.cpu_id], lease)
+        self.engine.close()
         self.assertEqual(self.hw.duties["demo/pwm1"], 38)
         other = Engine(FixedHardware(), self.path, demo=True)
         self.addCleanup(other.close)
@@ -98,7 +101,7 @@ class CoreTests(unittest.TestCase):
     def test_critical_raw_input_bypasses_average_limits_and_delays(self):
         config = copy.deepcopy(self.engine.config)
         fan = config["fans"][1]
-        fan.update(aggregation="average", max_duty=60, response_s=30, smoothing_s=60, step_up=1)
+        fan.update(sensor_ids=["@cpu-gpu"], aggregation="average", max_duty=60, response_s=30, smoothing_s=60, step_up=1)
         self.engine.update_config(config)
         self.engine.activate(self.case_id)
         self.hw.cpu = 100
@@ -310,14 +313,19 @@ class DiscoveryIdentificationTests(unittest.TestCase):
         self.assertIsNone(self.engine.identification)
         self.assertEqual(self.hw.duties["demo/pwm1"], 38)
 
-    def test_identification_pauses_a_curve_without_resuming_it(self):
+    def test_identification_restores_previous_curve_and_original_lease(self):
         id_ = self.engine.confirm_identity("demo/pwm1", "塔扇", "fan")
         self.engine.activate(id_)
+        lease = self.engine.leases[id_]
         self.engine.identify("demo/pwm1", 70)
         self.assertNotIn(id_, self.engine.enabled)
+        self.engine.tick()
+        self.assertEqual(self.hw.duties["demo/pwm1"], 70)
         self.engine.stop_identification()
+        self.assertIn(id_, self.engine.enabled)
+        self.assertIs(self.engine.leases[id_], lease)
+        self.engine.release(id_)
         self.assertEqual(self.hw.duties["demo/pwm1"], 38)
-        self.assertFalse(self.engine.enabled)
 
     def test_shutdown_restores_temporary_identification(self):
         self.engine.identify("demo/pwm1", 100)
@@ -469,16 +477,22 @@ class ManagedControllerTests(unittest.TestCase):
             self.engine.resume_controls()
         self.assertIn(self.id, self.engine.enabled)
 
-    def test_identification_does_not_return_to_a_curve_on_restart(self):
+    def test_identification_preserves_durable_policy_and_resumes_after_restart(self):
         self.engine.resume_controls()
         self.engine.identify("demo/pwm1", 100)
-        self.assertFalse(json.loads(self.path.read_text())["fans"][0]["autostart"])
+        self.assertTrue(json.loads(self.path.read_text())["fans"][0]["autostart"])
         self.engine.queue_autostart()
         self.engine.resume_controls()
         self.assertIsNotNone(self.engine.identification)
         self.engine.stop_identification()
         self.engine.resume_controls()
-        self.assertFalse(self.engine.enabled)
+        self.assertIn(self.id, self.engine.enabled)
+        self.engine.close()
+        self.assertEqual(self.hw.duties["demo/pwm1"], 38)
+        other = Engine(FixedHardware(), self.path, demo=True, managed=True)
+        self.addCleanup(other.close)
+        other.resume_controls()
+        self.assertIn(self.id, other.enabled)
 
     def test_background_loop_runs_without_any_browser_client(self):
         self.engine.start()
