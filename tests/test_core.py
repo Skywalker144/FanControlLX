@@ -80,11 +80,50 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.hw.duties["demo/pwm1"], original)
 
     def test_zero_curve_on_motherboard_still_obeys_minimum_output(self):
-        self.engine.patch_fan(self.cpu_id, {"points": [[25, 0], [85, 0]]})
+        self.engine.patch_fan(self.cpu_id, {"points": [[25, 0], [85, 0]], "min_duty": 30})
         self.engine.activate(self.cpu_id)
+        self.engine.tick(now=time.monotonic() + 20)
         output = self.engine.state()["outputs"][self.cpu_id]
         self.assertFalse(output["automatic"])
-        self.assertGreaterEqual(output["target"], 30)
+        self.assertEqual(output["target"], 30)
+
+    def test_default_curve_and_unrestricted_output_range(self):
+        fan = default_fan("new-fan")
+        self.assertEqual(fan["points"], [[30, 20], [50, 50], [80, 100]])
+        self.assertEqual((fan["min_duty"], fan["max_duty"], fan["critical_temp"]), (0, 100, 85))
+        for output in (0, 10, 20):
+            self.engine.patch_fan(self.cpu_id, {"mode": "manual", "manual_duty": output,
+                                              "min_duty": 0, "max_duty": output,
+                                              "response_s": 0, "step_down": 100})
+            self.engine.tick(now=time.monotonic() + 5)
+            self.assertEqual(self.engine.state()["outputs"][self.cpu_id]["target"], output)
+
+    def test_intentional_zero_output_does_not_trigger_stall_protection(self):
+        self.engine.patch_fan(self.cpu_id, {"points": [[25, 0], [85, 0]], "step_down": 100,
+                                          "response_s": 0, "smoothing_s": 0})
+        self.engine.activate(self.cpu_id)
+        self.hw.rpm_overrides["demo/fan1"] = 0
+        self.engine.tick(now=time.monotonic() + 20)
+        output = self.engine.state()["outputs"][self.cpu_id]
+        self.assertEqual(output["target"], 0)
+        self.assertIsNone(output["fault"])
+        self.hw.cpu = 100
+        self.engine.tick(now=time.monotonic() + 21)
+        self.assertEqual(self.engine.state()["outputs"][self.cpu_id]["target"], 100)
+
+    def test_normal_takeover_starts_at_half_output_with_limits_and_protection(self):
+        for changes, initial in [({}, 50), ({"min_duty": 70}, 70),
+                                 ({"min_duty": 0, "max_duty": 40}, 40)]:
+            if changes:
+                self.engine.patch_fan(self.cpu_id, changes)
+            with patch.object(self.hw, "acquire", wraps=self.hw.acquire) as acquire:
+                self.engine.activate(self.cpu_id)
+                acquire.assert_called_once_with("demo/pwm1", initial)
+            self.engine.release(self.cpu_id)
+        self.hw.cpu = 100
+        with patch.object(self.hw, "acquire", wraps=self.hw.acquire) as acquire:
+            self.engine.activate(self.cpu_id)
+            acquire.assert_called_once_with("demo/pwm1", 100)
 
     def test_saving_retains_control_but_foreground_restart_does_not_resume(self):
         self.engine.activate(self.cpu_id)
@@ -144,7 +183,7 @@ class CoreTests(unittest.TestCase):
             validate_config(invalid)
 
     def test_invalid_numbers_and_empty_sources_rejected(self):
-        for key, value in [("critical_temp", float("nan")), ("manual_duty", True), ("min_duty", 0), ("sensor_ids", [])]:
+        for key, value in [("critical_temp", float("nan")), ("manual_duty", True), ("min_duty", -1), ("sensor_ids", [])]:
             with self.subTest(key=key):
                 invalid = copy.deepcopy(self.engine.config)
                 invalid["fans"][0][key] = value
@@ -342,6 +381,8 @@ class DiscoveryIdentificationTests(unittest.TestCase):
     def test_untouched_legacy_placeholders_removed_but_custom_curves_preserved(self):
         old = [default_fan("cpu-fan", "CPU 散热风扇", "@cpu"),
                default_fan("case-fan", "机箱风扇", "@cpu-gpu")]
+        for f in old:
+            f.update(points=[[25, 30], [40, 35], [55, 50], [70, 75], [85, 100]], min_duty=30)
         old[1]["points"][1][1] = 43
         path = Path(self.temp.name) / "legacy.json"
         path.write_text(json.dumps({"version": 1, "fans": old}))
