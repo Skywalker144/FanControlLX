@@ -79,6 +79,13 @@ class CoreTests(unittest.TestCase):
         self.engine.release(self.cpu_id)
         self.assertEqual(self.hw.duties["demo/pwm1"], original)
 
+    def test_zero_curve_on_motherboard_still_obeys_minimum_output(self):
+        self.engine.patch_fan(self.cpu_id, {"points": [[25, 0], [85, 0]]})
+        self.engine.activate(self.cpu_id)
+        output = self.engine.state()["outputs"][self.cpu_id]
+        self.assertFalse(output["automatic"])
+        self.assertGreaterEqual(output["target"], 30)
+
     def test_saving_retains_control_but_foreground_restart_does_not_resume(self):
         self.engine.activate(self.cpu_id)
         lease = self.engine.leases[self.cpu_id]
@@ -526,7 +533,7 @@ class HardwareTests(unittest.TestCase):
         self.hw.mkdir(parents=True)
         for name, value in {"name": "nct6687", "pwm1": "100", "pwm1_enable": "2", "temp1_input": "45000"}.items():
             (self.hw / name).write_text(value)
-        self.backend = Hardware(self.root / "class")
+        self.backend = Hardware(self.root / "class", nvidia=False)
         self.backend.gpu = lambda: []
 
     def test_full_acquire_restore_cycle_on_fake_sysfs(self):
@@ -553,7 +560,7 @@ class HardwareTests(unittest.TestCase):
         link = self.root / "links"
         link.mkdir()
         (link / "hwmon1").symlink_to(real)
-        backend = Hardware(link)
+        backend = Hardware(link, nvidia=False)
         backend.gpu = lambda: []
         id1 = backend.discover()[2][0]["id"]
         (link / "hwmon1").unlink()
