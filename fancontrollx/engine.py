@@ -7,12 +7,17 @@ import logging
 import math
 import threading
 import time
+import uuid
 from collections import deque
 from pathlib import Path
 
 from .config import default_config, default_fan, number, save_config, validate_config
 
 log = logging.getLogger(__name__)
+
+
+class ConfigConflict(OSError):
+    """An editor tried to overwrite settings changed by another client."""
 
 
 def interpolate(points, temperature):
@@ -127,6 +132,8 @@ class Engine:
     def request_control(self, id_, enabled):
         """Web requests set a durable control policy when managed by systemd."""
         with self.lock:
+            if self.identification:
+                self.stop_identification()
             if not self.managed:
                 return self.activate(id_) if enabled else self.release(id_)
             config = copy.deepcopy(self.config)
@@ -164,7 +171,7 @@ class Engine:
                 self.stop_identification()
                 test = None
             for id_ in list(self.leases):
-                if id_ not in self.enabled:
+                if id_ not in self.enabled and not (test and test.get("resume_id") == id_):
                     try:
                         self.release(id_, cancel_pending=False)
                     except OSError:
@@ -196,6 +203,7 @@ class Engine:
                     samples.popleft()
                 smoothed = sum(x[1] for x in samples) / len(samples) if samples and raw is not None else raw
                 fault = None
+                requested = None
                 # Emergency threshold sees the hottest RAW input, bypassing averaging and all delays.
                 if values is None:
                     duty, fault = 100, "温度源不可用，保护输出 100%"
@@ -207,11 +215,13 @@ class Engine:
                         effective = memory["temp"]
                     else:
                         memory["temp"] = effective
-                    duty = f["manual_duty"] if f["mode"] == "manual" else interpolate(f["points"], effective)
+                    points = next((c["points"] for c in self.config["curves"] if c["id"] == f["curve_id"]), f["points"])
+                    duty = f["manual_duty"] if f["mode"] == "manual" else interpolate(points, effective)
                     duty = max(f["min_duty"], min(f["max_duty"], duty))
+                    requested = duty
                     previous = memory["duty"]
                     if previous is not None:
-                        if now - memory["changed_at"] < f["response_s"]:
+                        if f["mode"] != "manual" and now - memory["changed_at"] < f["response_s"]:
                             duty = previous
                         dt = max(0, min(5, now - memory["last_time"]))
                         duty = max(previous - f["step_down"] * dt, min(previous + f["step_up"] * dt, duty))
@@ -221,6 +231,7 @@ class Engine:
                 active_since = memory.get("active_since", now)
                 if f["id"] in self.enabled and now - active_since > 10 and f["rpm_sensor_id"] and (tach is None or tach <= 0):
                     duty, fault = 100, "测速信号丢失或风扇停转，保护输出 100%"
+                    requested = 100
                 memory["last_time"], memory["duty"] = now, duty
                 channel = lookup.get(f["channel_id"])
                 status = "待绑定通道" if not f["channel_id"] else ("通道离线" if channel is None else "未接管")
@@ -240,6 +251,8 @@ class Engine:
                 outputs[f["id"]] = {"temperature": round(raw, 1) if raw is not None else None,
                                       "smoothed": round(smoothed, 1) if smoothed is not None else None,
                                       "target": round(duty, 1), "rpm": tach, "status": status,
+                                      "requested": round(requested if requested is not None else duty, 1),
+                                      "actual": channel.get("duty") if channel else None,
                                       "active": f["id"] in self.enabled, "fault": fault}
             self.snapshot = {"sensors": sensors, "fans": fans, "channels": channels,
                              "chips": chips, "outputs": outputs}
@@ -266,6 +279,8 @@ class Engine:
                                   "gpu_error": self.hardware.gpu_error, "time": time.time(),
                                   "discovery": self.discovery(), "identification": identification,
                                   "background_service": self.managed,
+                                  "config_revision": self.config_revision(),
+                                  "workspace_api": 2,
                                   "pending_autostart": {id_: p["reason"] for id_, p in self.pending_autostart.items()}})
 
     def discovery(self):
@@ -287,9 +302,8 @@ class Engine:
 
     def discovered_fan(self, channel):
         id_ = "fan-" + hashlib.sha256(channel["id"].encode()).hexdigest()[:16]
-        source = "@cpu" if "cpu" in channel["name"].lower() or not any(
-            s["kind"] == "gpu" for s in self.snapshot["sensors"]) else "@cpu-gpu"
-        f = default_fan(id_, channel["name"], source)
+        # Hardware names never determine which temperature a user should follow.
+        f = default_fan(id_, channel["name"])
         f.update(channel_id=channel["id"], rpm_sensor_id=channel.get("rpm_sensor_id"))
         return f
 
@@ -350,18 +364,20 @@ class Engine:
             # Finish a previous test before taking a different channel.
             if self.identification and self.identification["channel_id"] != channel_id:
                 self.stop_identification()
-            for f in self.config["fans"]:
-                if f["channel_id"] == channel_id:
-                    if self.managed and f["autostart"]:
-                        # Identification temporarily overrides a channel; do not
-                        # let a restart silently turn its old curve back on.
-                        self.request_control(f["id"], False)
-                    elif f["id"] in self.enabled:
-                        self.release(f["id"])
             effective, fault = self.identification_duty(duty, self.snapshot["sensors"])
             if self.identification is None:
-                lease = self.hardware.acquire(channel_id, effective)
+                active = next((f["id"] for f in self.config["fans"]
+                               if f["channel_id"] == channel_id and f["id"] in self.enabled), None)
+                if active:
+                    # Borrow the existing lease: keep its original firmware state
+                    # and durable policy intact throughout the temporary test.
+                    lease = self.leases[active]
+                    self.hardware.write(channel_id, effective)
+                    self.enabled.remove(active)
+                else:
+                    lease = self.hardware.acquire(channel_id, effective)
                 self.identification = {"channel_id": channel_id, "lease": lease,
+                                       "resume_id": active,
                                        "stopping": False, "duty": duty,
                                        "effective_duty": effective, "fault": fault,
                                        "expires_at": time.monotonic() + 15}
@@ -375,12 +391,23 @@ class Engine:
                 self.identification.update(duty=duty, effective_duty=effective,
                                            fault=fault, expires_at=time.monotonic() + 15)
 
-    def stop_identification(self, channel_id=None):
+    def stop_identification(self, channel_id=None, resume=True):
         with self.lock:
             test = self.identification
             if test is None or (channel_id is not None and test["channel_id"] != channel_id):
                 return
+            if test["stopping"]:
+                resume = resume and test.get("resume_requested", True)
+            test["resume_requested"] = resume
             test["stopping"] = True
+            active = test.get("resume_id")
+            if active and resume and not self.stop_event.is_set():
+                self.enabled.add(active)
+                self.identification = None
+                # Begin at the last test output and let the normal limits apply.
+                self.memory[active]["duty"] = test["effective_duty"]
+                self.event("识别测试结束，已恢复此前的控制模式")
+                return
             try:
                 self.hardware.restore(test["lease"])
             except OSError as exc:
@@ -388,6 +415,8 @@ class Engine:
                 self.event(self.error)
                 raise
             self.identification = None
+            if active:
+                self.leases.pop(active, None)
             if not self.leases:
                 self.hardware.disarm([test["lease"]])
             self.event("识别测试结束，已恢复接管前状态")
@@ -415,32 +444,35 @@ class Engine:
             save_config(self.config_path, config)
             self.config = config
             self.tick()
-            self.event(f"已确认设备：{f['name']}；未自动启用曲线控制")
+            self.event(f"已保存设备：{f['name']}")
             return f["id"]
 
-    def update_config(self, value):
-        config = validate_config(value)
+    def config_revision(self):
+        return hashlib.sha256(json.dumps(self.config, sort_keys=True).encode()).hexdigest()
+
+    def update_config(self, value, expected_revision=None):
         with self.lock:
-            if self.managed:
-                self.stop_identification()
-                wanted = {f["id"]: f for f in config["fans"]
-                          if f["autostart"] and f["identified"] and f["channel_id"]}
-                previous = {f["id"]: f for f in self.config["fans"]}
-                for id_ in list(self.leases):
-                    if id_ not in wanted or wanted[id_]["channel_id"] != previous[id_]["channel_id"]:
-                        self.release(id_)
-                # Keep existing leases for unchanged channels. A curve edit must
-                # not hand every other fan back to firmware or run it at 100%.
-                retained = {id_: memory for id_, memory in self.memory.items() if id_ in self.enabled}
-                for memory in retained.values():
-                    memory["samples"].clear()
-                    memory["temp"] = None
-                self.memory = retained
-            else:
-                # Foreground mode retains its explicit save-then-enable workflow.
-                self.release_all()
-                self.memory.clear()
+            if expected_revision is not None and expected_revision != self.config_revision():
+                raise ConfigConflict("配置已在另一页面更新，请重新打开后再操作")
+            config = validate_config(value)
+            previous = {f["id"]: f for f in self.config["fans"]}
+            for f in config["fans"]:
+                old = previous.get(f["id"])
+                if old and old["channel_id"] != f["channel_id"]:
+                    f.update(identified=False, device_kind="unknown", autostart=False)
+            # Persist first. A disk error must not silently stop running fans.
             save_config(self.config_path, config)
+            self.stop_identification()
+            wanted = {f["id"]: f for f in config["fans"] if f["identified"] and f["channel_id"]
+                      and (f["autostart"] if self.managed else f["id"] in self.enabled)}
+            for id_ in list(self.leases):
+                if id_ not in wanted or wanted[id_]["channel_id"] != previous[id_]["channel_id"]:
+                    self.release(id_)
+            for f in config["fans"]:
+                old = previous.get(f["id"])
+                if f["id"] in self.memory and old and any(f[k] != old[k] for k in ("sensor_ids", "aggregation", "smoothing_s")):
+                    self.memory[f["id"]]["samples"].clear()
+                    self.memory[f["id"]]["temp"] = None
             self.config = config
             self.tick()
             self.queue_autostart()
@@ -448,7 +480,57 @@ class Engine:
                 self.resume_controls()
                 self.event("配置已保存并应用后台控制策略")
             else:
-                self.event("配置已保存；如需调速，请重新启用相应风扇")
+                self.event("配置已保存，正在控制的设备已更新")
+
+    def patch_fan(self, id_, changes, expected=None):
+        with self.lock:
+            if not isinstance(changes, dict) or not changes or set(changes) - (set(default_fan()) - {"id", "identified"}):
+                raise ValueError("风扇设置字段无效")
+            config = copy.deepcopy(self.config)
+            fan = next((f for f in config["fans"] if f["id"] == id_), None)
+            if fan is None:
+                raise ValueError("风扇不存在")
+            if expected is not None and (not isinstance(expected, dict) or any(fan.get(k) != v for k, v in expected.items())):
+                raise ConfigConflict("此风扇的设置已更新，请重新打开后再操作")
+            fan.update(changes)
+            self.update_config(config)
+
+    def save_curve(self, curve, expected=None, assign_to=None, expected_fan=None):
+        with self.lock:
+            if not isinstance(curve, dict):
+                raise ValueError("曲线必须是对象")
+            config = copy.deepcopy(self.config)
+            current = next((c for c in config["curves"] if c["id"] == curve.get("id")), None)
+            if expected is not None and current != expected:
+                raise ConfigConflict("此曲线已更新，请重新打开后再操作")
+            id_ = curve.get("id") or str(uuid.uuid4())
+            saved = {"id": id_, "name": curve.get("name"), "points": curve.get("points")}
+            if current:
+                config["curves"][config["curves"].index(current)] = saved
+            else:
+                config["curves"].append(saved)
+            if assign_to:
+                fan = next((f for f in config["fans"] if f["id"] == assign_to), None)
+                if fan is None:
+                    raise ValueError("风扇不存在")
+                if expected_fan is not None and any(fan.get(k) != v for k, v in expected_fan.items()):
+                    raise ConfigConflict("风扇曲线已更新，请重新打开后再操作")
+                fan["curve_id"] = id_
+            self.update_config(config)
+            return id_
+
+    def delete_curve(self, id_, expected=None):
+        with self.lock:
+            config = copy.deepcopy(self.config)
+            curve = next((c for c in config["curves"] if c["id"] == id_), None)
+            if curve is None:
+                raise ValueError("曲线不存在")
+            if expected is not None and curve != expected:
+                raise ConfigConflict("此曲线已更新，请刷新后重试")
+            if any(f["curve_id"] == id_ for f in config["fans"]):
+                raise ValueError("请先为引用此曲线的风扇选择其他曲线")
+            config["curves"].remove(curve)
+            self.update_config(config)
 
     def activate(self, id_):
         with self.lock:
@@ -505,7 +587,7 @@ class Engine:
         self.pending_autostart.clear()
         errors = []
         try:
-            self.stop_identification()
+            self.stop_identification(resume=False)
         except OSError as exc:
             errors.append(str(exc))
         for id_ in list(self.leases):
