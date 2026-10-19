@@ -12,8 +12,8 @@ def default_fan(id_="", name="未命名风扇", source="@cpu"):
     return {"id": id_, "name": name, "channel_id": None, "rpm_sensor_id": None,
             "identified": False, "device_kind": "unknown", "autostart": False, "curve_id": None,
             "sensor_ids": [source], "aggregation": "max", "mode": "curve",
-            "points": [[25, 30], [40, 35], [55, 50], [70, 75], [85, 100]],
-            "manual_duty": 50, "min_duty": 30, "max_duty": 100,
+            "points": [[30, 20], [50, 50], [80, 100]],
+            "manual_duty": 50, "min_duty": 0, "max_duty": 100,
             "hysteresis": 2, "response_s": 3, "smoothing_s": 5,
             "step_up": 25, "step_down": 5, "critical_temp": 85}
 
@@ -100,8 +100,8 @@ def validate_config(value):
             raise ValueError("请至少选择一个有效温度源")
         if len(set(sensors)) != len(sensors):
             raise ValueError("温度源不能重复")
-        for key, bounds in {"manual_duty": (0, 100), "min_duty": (20, 100),
-                            "max_duty": (20, 100), "hysteresis": (0, 15),
+        for key, bounds in {"manual_duty": (0, 100), "min_duty": (0, 100),
+                            "max_duty": (0, 100), "hysteresis": (0, 15),
                             "response_s": (0, 30), "smoothing_s": (0, 60),
                             "step_up": (1, 100), "step_down": (1, 100),
                             "critical_temp": (50, 105)}.items():
