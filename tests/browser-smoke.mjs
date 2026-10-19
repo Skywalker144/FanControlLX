@@ -43,90 +43,170 @@ try{
     return result.result.value;
   };
   const waitFor=async expression=>{const deadline=Date.now()+10000;while(Date.now()<deadline){if(await evaluate(expression))return;await new Promise(resolve=>setTimeout(resolve,120));}throw new Error(`Wait timed out: ${expression}`);};
+  const reloadPage=async()=>{
+    const loaded=new Promise((resolve,reject)=>{
+      const onLoad=event=>{
+        const message=JSON.parse(event.data);
+        if(message.method==='Page.loadEventFired'&&message.sessionId===session){
+          clearTimeout(timer);socket.removeEventListener('message',onLoad);resolve();
+        }
+      };
+      const timer=setTimeout(()=>{socket.removeEventListener('message',onLoad);reject(new Error('Page reload timed out'));},12000);
+      socket.addEventListener('message',onLoad);
+    });
+    await Promise.all([send('Page.reload'),loaded]);
+  };
   await waitFor('document.getElementById("connection-text")?.textContent.includes("已连接")');
-  assert.equal(await evaluate('document.querySelectorAll("#point-list .point").length'),5);
-  assert.equal(await evaluate('document.documentElement.scrollWidth <= window.innerWidth'),true,'Desktop horizontal overflow');
+  assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'),true,'Desktop overflow');
   if(!snapshotOnly){
-    assert.equal(await evaluate('(async()=> (await (await fetch("/api/state")).json()).demo)()'),true,'Mutating browser tests must run in demo mode');
-    const initialFans=await evaluate('document.querySelectorAll(".fan-card").length');
-    assert.equal(initialFans,3,'All three simulated connected fans must be discovered');
-    assert.equal(await evaluate('document.querySelectorAll("#discovered-fans .discovery-card").length'),3);
-    // Identify the first real channel in the simulation before enabling its curve.
-    await evaluate(`document.querySelector('[data-identify]').click()`);
-    await waitFor(`document.getElementById('identify-dialog').open`);
+    assert.equal(await evaluate('(async()=>{const s=await(await fetch("/api/state")).json();return s.demo&&s.workspace_api===2})()'),true,'Mutations require the new demo backend');
+    await evaluate(`(async()=>{const s=await(await fetch('/api/state')).json();for(const [path,body] of [['/api/config',{version:2,fans:[],curves:[]}],['/api/scan',{}]]){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-FanControl-Token':s.csrf_token},body:JSON.stringify(body)});if(!r.ok)throw new Error(await r.text());}})()`);
+    await reloadPage();
+    await waitFor('document.querySelectorAll("[data-fan]").length===3');
+    await evaluate(`document.querySelector('[data-create-curve]').click()`);
+    await waitFor('document.getElementById("curve-dialog").open');
+    await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
+    const saved=()=>evaluate('(async()=> (await(await fetch("/api/state")).json()).config)()');
+    const config=await saved();
+    assert.equal(config.fans.length,3);
+    const first=config.fans[0].id,second=config.fans[1].id;
+    const card=id=>`document.querySelector('[data-fan="${id}"]')`;
+    const post=async(path,body)=>evaluate(`(async()=>{const s=await(await fetch('/api/state')).json();const r=await fetch(${JSON.stringify(path)},{method:'POST',headers:{'Content-Type':'application/json','X-FanControl-Token':s.csrf_token},body:JSON.stringify(${JSON.stringify(body)})});if(!r.ok)throw new Error(await r.text());return r.json()})()`);
+    await evaluate(`document.querySelector('[data-tab="devices"]').click();document.querySelector('#discovered-fans [data-identify]').click()`);
+    await waitFor('document.getElementById("identify-dialog").open');
     await evaluate(`document.getElementById('identify-kind').value='fan';document.getElementById('identify-kind').dispatchEvent(new Event('change'));document.getElementById('identify-full').click()`);
     await waitFor(`document.getElementById('identify-test-status').textContent.includes('正在以 100%')`);
     await evaluate(`document.getElementById('identify-slider').value=70;document.getElementById('identify-slider').dispatchEvent(new Event('input'));document.getElementById('identify-slider').dispatchEvent(new Event('change'))`);
     await waitFor(`document.getElementById('identify-test-status').textContent.includes('正在以 70%')`);
-    assert.equal(await evaluate(`(async()=>{const s=await(await fetch('/api/state')).json();return s.identification.duty})()`),70);
     await evaluate(`document.getElementById('identify-stop').click()`);
     await waitFor(`(async()=> (await(await fetch('/api/state')).json()).identification===null)()`);
-    await evaluate(`document.getElementById('identify-name').value='前置进风';document.getElementById('identify-save').click()`);
+    await waitFor(`!document.getElementById('identify-save').disabled`);
+    await evaluate(`document.getElementById('identify-name').value='前置风扇';document.getElementById('identify-save').click()`);
     await waitFor(`!document.getElementById('identify-dialog').open`);
-    assert.equal(await evaluate(`(async()=> (await(await fetch('/api/state')).json()).config.fans[0].name)()`),'前置进风');
-    assert.equal(await evaluate(`(async()=> (await(await fetch('/api/state')).json()).config.fans[0].identified)()`),true);
-    await evaluate(`document.getElementById('scan-fans').click()`);
-    await waitFor(`!document.getElementById('scan-fans').disabled`);
-    assert.equal(await evaluate('document.querySelectorAll(".fan-card").length'),initialFans,'Rescan must not duplicate fans');
-    assert.equal(await evaluate(`document.getElementById('fan-name').value`),'前置进风');
-    await evaluate('document.getElementById("preset").value="quiet";document.getElementById("preset").dispatchEvent(new Event("change"))');
-    assert.equal(await evaluate('document.querySelector("[data-point=\\"1\\"][data-axis=\\"1\\"]").value'),'30');
-    // Drag the third curve point with actual pointer input.
+    await evaluate(`document.querySelector('[data-tab="control"]').click()`);
+    await evaluate(`${card(first)}.querySelector('[data-field="source"]').value='@gpu';${card(first)}.querySelector('[data-field="source"]').dispatchEvent(new Event('change',{bubbles:true}))`);
+    await waitFor(`(async()=> (await(await fetch('/api/state')).json()).config.fans[0].sensor_ids[0]==='@gpu')()`);
+    await waitFor(`${card(first)}.querySelector('[data-edit-curve]').disabled===false`);
+    const initialPoints=JSON.stringify((await saved()).fans[0].points);
+    await evaluate(`${card(first)}.querySelector('[data-edit-curve]').click()`);
+    await waitFor('document.getElementById("curve-dialog").open');
+    await evaluate(`document.getElementById('preset').value='quiet';document.getElementById('preset').dispatchEvent(new Event('change'))`);
     await evaluate(`document.getElementById('curve-chart').scrollIntoView({block:'center'})`);
-    const box=await evaluate('(()=>{const b=document.querySelector("#curve-chart [data-node=\\"2\\"] circle").getBoundingClientRect();return{x:b.x+b.width/2,y:b.y+b.height/2}})()');
+    const box=await evaluate(`(()=>{const b=document.querySelector('#curve-chart [data-node="2"]').getBoundingClientRect();return{x:b.x+b.width/2,y:b.y+b.height/2}})()`);
     await send('Input.dispatchMouseEvent',{type:'mousePressed',x:box.x,y:box.y,button:'left',clickCount:1});
-    await send('Input.dispatchMouseEvent',{type:'mouseMoved',x:box.x+12,y:box.y-12,buttons:1});
-    await send('Input.dispatchMouseEvent',{type:'mouseReleased',x:box.x+12,y:box.y-12,button:'left',clickCount:1});
-    assert.notEqual(await evaluate('document.querySelector("[data-point=\\"2\\"][data-axis=\\"1\\"]").value'),'42');
-    await evaluate('document.getElementById("add-point").click()');
-    assert.equal(await evaluate('document.querySelectorAll("#point-list .point").length'),6);
-    await evaluate('document.querySelector("[data-remove-point=\\"1\\"]").click()');
-    assert.equal(await evaluate('document.querySelectorAll("#point-list .point").length'),5);
-    await evaluate('document.getElementById("fan-name").value="测试 CPU 风扇";document.getElementById("fan-name").dispatchEvent(new Event("input"));document.getElementById("save-config").click()');
-    await waitFor('document.getElementById("save-status").textContent.includes("已保存")');
-    assert.equal(await evaluate('(async()=> (await (await fetch("/api/state")).json()).config.fans[0].name)()'),'测试 CPU 风扇');
-    await evaluate('document.querySelector("[data-action=\\"activate\\"]").click()');
-    await waitFor('document.querySelector("[data-action=\\"release\\"]")!==null');
-    await evaluate('document.getElementById("release-all").click()');
-    await waitFor('document.querySelector("[data-action=\\"release\\"]")===null');
-    await evaluate('document.getElementById("add-fan").click();document.getElementById("new-fan-name").value="后置风扇";document.querySelector("#add-dialog button[value=\\"add\\"]").click()');
-    await waitFor(`document.querySelectorAll('.fan-card').length===${initialFans+1}`);
-    await evaluate('document.getElementById("save-config").click()');
-    await waitFor('document.getElementById("save-status").textContent.includes("已保存")');
-    // Reload proves the data is persistent rather than only held in the editor.
-    await send('Page.reload');
-    await waitFor(`document.querySelectorAll('.fan-card').length===${initialFans+1}`);
-    assert.equal(await evaluate('document.querySelectorAll("[data-action=\\"release\\"]").length'),0);
-    assert.equal(await evaluate(`(async()=> (await(await fetch('/api/state')).json()).config.fans.at(-1).identified)()`),false,'An offline configuration must not inherit another device identity');
-    await evaluate('document.querySelector("[data-tab=\\"sensors\\"]").click()');
-    assert.equal(await evaluate('document.querySelectorAll("#sensor-table tr").length'),6);
-    await evaluate('document.querySelector("[data-tab=\\"diagnostics\\"]").click()');
-    assert.equal(await evaluate('document.getElementById("diagnostics-content").textContent.includes("PWM 控制通道")'),true);
-    await evaluate('document.querySelector("[data-tab=\\"control\\"]").click()');
-    const managed=await evaluate(`(async()=> (await(await fetch('/api/state')).json()).background_service)()`);
-    if(managed){
-      await evaluate(`document.querySelector('[data-fan]').click();document.getElementById('autostart-control').checked=true;document.getElementById('autostart-control').dispatchEvent(new Event('change'));document.getElementById('save-config').click()`);
-      await waitFor(`(async()=>{const s=await(await fetch('/api/state')).json();return s.config.fans[0].autostart&&s.outputs[s.config.fans[0].id].active})()`);
-      assert.equal(await evaluate(`document.getElementById('save-config').textContent.includes('应用')`),true);
-      await evaluate(`document.querySelector('[data-action="release"]').click()`);
-      await waitFor(`(async()=> !(await(await fetch('/api/state')).json()).config.fans[0].autostart)()`);
-      await waitFor(`!document.getElementById('save-config').disabled`);
-      await evaluate(`document.getElementById('autostart-control').checked=true;document.getElementById('autostart-control').dispatchEvent(new Event('change'));document.getElementById('save-config').click()`);
-      await waitFor(`(async()=>{const s=await(await fetch('/api/state')).json();return s.config.fans[0].autostart&&s.outputs[s.config.fans[0].id].active})()`);
-    }
+    await send('Input.dispatchMouseEvent',{type:'mouseMoved',x:box.x+18,y:box.y-12,buttons:1});
+    await send('Input.dispatchMouseEvent',{type:'mouseReleased',x:box.x+18,y:box.y-12,button:'left',clickCount:1});
+    assert.notEqual(await evaluate(`document.querySelector('[data-point="2"][data-axis="1"]').value`),'42');
+    await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
+    await waitFor('!document.getElementById("curve-dialog").open');
+    assert.equal(JSON.stringify((await saved()).fans[0].points),initialPoints,'Cancel must leave running curve untouched');
+    await evaluate(`${card(first)}.querySelector('[data-edit-curve]').click();document.getElementById('curve-share').checked=true;document.getElementById('curve-share').dispatchEvent(new Event('change'));document.getElementById('curve-name').value='日常曲线';document.getElementById('preset').value='quiet';document.getElementById('preset').dispatchEvent(new Event('change'));document.getElementById('curve-form').requestSubmit()`);
+    await waitFor('!document.getElementById("curve-dialog").open');
+    const curve=(await saved()).curves[0];
+    assert.equal(curve.name,'日常曲线');
+    assert.equal((await saved()).fans[0].curve_id,curve.id);
+    await evaluate(`${card(second)}.querySelector('[data-field="curve_id"]').value=${JSON.stringify(curve.id)};${card(second)}.querySelector('[data-field="curve_id"]').dispatchEvent(new Event('change',{bubbles:true}))`);
+    await waitFor(`(async()=> (await(await fetch('/api/state')).json()).config.fans[1].curve_id===${JSON.stringify(curve.id)})()`);
+    await waitFor(`${card(second)}.querySelector('[data-field="source"]').disabled===false`);
+    await evaluate(`${card(second)}.querySelector('[data-field="source"]').value='@cpu-gpu';${card(second)}.querySelector('[data-field="source"]').dispatchEvent(new Event('change',{bubbles:true}))`);
+    await waitFor(`(async()=> (await(await fetch('/api/state')).json()).config.fans[1].sensor_ids[0]==='@cpu-gpu')()`);
+    await evaluate(`document.querySelector('[data-library-edit]').click();document.getElementById('preset').value='performance';document.getElementById('preset').dispatchEvent(new Event('change'));document.getElementById('curve-form').requestSubmit()`);
+    await waitFor('!document.getElementById("curve-dialog").open');
+    assert.deepEqual((await saved()).fans.slice(0,2).map(f=>f.sensor_ids),[['@gpu'],['@cpu-gpu']]);
+    assert.equal(await evaluate('document.querySelector("[data-library-delete]").disabled'),true);
+    await evaluate(`${card(first)}.querySelector('[data-mode="manual"]').click()`);
+    await waitFor(`${card(first)}.querySelector('[data-manual]')?.disabled===false`);
+    await evaluate(`${card(first)}.querySelector('[data-manual]').value=67;${card(first)}.querySelector('[data-manual]').dispatchEvent(new Event('input',{bubbles:true}));${card(first)}.querySelector('[data-manual]').dispatchEvent(new Event('change',{bubbles:true}))`);
+    await waitFor(`(async()=> (await(await fetch('/api/state')).json()).config.fans[0].manual_duty===67)()`);
+    await waitFor(`${card(first)}.querySelector('[data-toggle]').disabled===false`);
+    await evaluate(`${card(first)}.querySelector('[data-toggle]').click()`);
+    await waitFor(`(async()=> (await(await fetch('/api/state')).json()).outputs[${JSON.stringify(first)}].active)()`);
+    await waitFor(`${card(first)}.querySelector('[data-device]').disabled===false`);
+    await evaluate(`${card(first)}.querySelector('[data-device]').click();document.getElementById('min-duty').value=35;document.getElementById('min-duty').dispatchEvent(new Event('input',{bubbles:true}));document.getElementById('device-form').requestSubmit()`);
+    await waitFor('!document.getElementById("device-dialog").open');
+    assert.equal((await saved()).fans[0].min_duty,35);
+    await evaluate(`document.querySelector('[data-tab="devices"]').click();document.querySelector('#discovered-fans [data-identify]').click();document.getElementById('identify-full').click()`);
+    await waitFor(`document.getElementById('identify-test-status').textContent.includes('正在以 100%')`);
+    await evaluate(`document.getElementById('identify-close').click()`);
+    await waitFor('!document.getElementById("identify-dialog").open');
+    await waitFor(`(async()=> (await(await fetch('/api/state')).json()).outputs[${JSON.stringify(first)}].active)()`);
+    await evaluate(`document.getElementById('scan-fans').click()`);
+    await waitFor('!document.getElementById("scan-fans").disabled');assert.equal((await saved()).fans.length,3);
+    await evaluate(`document.getElementById('add-fan').click();document.getElementById('new-fan-name').value='离线风扇';document.getElementById('add-form').requestSubmit()`);
+    await waitFor('!document.getElementById("add-dialog").open');
+    const offline=(await saved()).fans.find(f=>f.name==='离线风扇');assert.ok(offline);assert.equal(offline.channel_id,null);
+    await evaluate(`document.querySelector('[data-tab="control"]').click();${card(offline.id)}.querySelector('[data-device]').click();document.getElementById('delete-fan').click()`);
+    await waitFor('!document.getElementById("device-dialog").open');assert.equal((await saved()).fans.length,3);
+    await evaluate(`document.getElementById('new-curve').click();document.getElementById('curve-name').value='未分配曲线';document.getElementById('curve-form').requestSubmit()`);
+    await waitFor('!document.getElementById("curve-dialog").open');
+    assert.equal((await saved()).curves.length,2);
+    const free=(await saved()).curves.find(c=>c.name==='未分配曲线');
+    await evaluate(`document.querySelector('[data-library-copy="${free.id}"]').click();document.getElementById('curve-form').requestSubmit()`);
+    await waitFor('!document.getElementById("curve-dialog").open');assert.equal((await saved()).curves.length,3);
+    await evaluate(`document.querySelector('[data-library-delete="${free.id}"]').click()`);
+    await waitFor(`(async()=> (await(await fetch('/api/state')).json()).config.curves.length===2)()`);
+    // Another client changes the shared curve while this editor is open.
+    await evaluate(`document.querySelector('[data-library-edit="${curve.id}"]').click()`);
+    const latest=(await saved()).curves.find(c=>c.id===curve.id);
+    await post('/api/curve',{curve:{...latest,name:'来自另一页面'},expected:latest});
+    await evaluate(`document.getElementById('curve-form').requestSubmit()`);
+    await waitFor(`!document.getElementById('curve-error').hidden`);
+    assert.equal(await evaluate(`document.getElementById('curve-dialog').open`),true);
+    await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
+    await waitFor('!document.getElementById("curve-dialog").open');
+    await reloadPage();
+    await waitFor(`${card(first)}?.querySelector('[data-manual]')?.value==='67'`);
+    assert.deepEqual((await saved()).fans.slice(0,2).map(f=>f.sensor_ids),[['@gpu'],['@cpu-gpu']]);
+    assert.equal((await saved()).curves.find(c=>c.id===curve.id).name,'来自另一页面');
+    for(const name of ['sensors','diagnostics','devices','control'])await evaluate(`document.querySelector('[data-tab="${name}"]').click()`);
   }
   await mkdir('test-results',{recursive:true});
+  // Theme preference survives reload; every navigation destination fits narrow screens.
+  await evaluate(`document.getElementById('theme-toggle').click()`);
+  assert.equal(await evaluate('document.documentElement.dataset.theme'),'dark');
+  await reloadPage();
+  await waitFor('document.getElementById("connection-text")?.textContent.includes("已连接")');
+  assert.equal(await evaluate('document.documentElement.dataset.theme'),'dark');
+  assert.equal(await evaluate(`document.getElementById('theme-toggle').getAttribute('aria-pressed')`),'true');
   await evaluate('window.scrollTo(0,0)');
   const prefix=snapshotOnly?'real':'demo';
-  const desktop=await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});
+  const fullScreenshot=async()=>{
+    await evaluate('Promise.all(document.getAnimations().map(animation=>animation.finished.catch(()=>{})))');
+    const {cssContentSize}=await send('Page.getLayoutMetrics');
+    return send('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:{x:0,y:0,width:cssContentSize.width,height:cssContentSize.height,scale:1}});
+  };
+  const dark=await fullScreenshot();
+  await writeFile(`test-results/${prefix}-desktop-dark.png`,Buffer.from(dark.data,'base64'));
+  await evaluate(`document.getElementById('theme-toggle').click()`);
+  assert.equal(await evaluate('document.documentElement.dataset.theme'),'light');
+  for(const width of [320,768,1024]){
+    await send('Emulation.setDeviceMetricsOverride',{width,height:900,deviceScaleFactor:1,mobile:width<580});
+    for(const name of ['devices','sensors','diagnostics','control']){
+      await evaluate(`document.querySelector('nav [data-tab="${name}"]').click()`);
+      assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'),true,`${name} overflow at ${width}px`);
+      assert.equal(await evaluate(`document.querySelector('nav [aria-current="page"]').dataset.tab`),name);
+    }
+  }
+  await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+  const desktop=await fullScreenshot();
   await writeFile(`test-results/${prefix}-desktop.png`,Buffer.from(desktop.data,'base64'));
   await send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
   await new Promise(resolve=>setTimeout(resolve,300));
-  assert.equal(await evaluate('document.documentElement.scrollWidth <= window.innerWidth'),true,'Mobile horizontal overflow');
+  assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'),true,'Mobile overflow');
   const mobile=await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});
   await writeFile(`test-results/${prefix}-mobile.png`,Buffer.from(mobile.data,'base64'));
+  if(!snapshotOnly){
+    await evaluate(`document.querySelector('[data-edit-curve]').click()`);
+    await waitFor('document.getElementById("curve-dialog").open');
+    await send('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});
+    assert.equal(await evaluate(`getComputedStyle(document.getElementById('curve-dialog')).animationName`),'none');
+    assert.equal(await evaluate('document.getElementById("curve-dialog").scrollWidth <= document.getElementById("curve-dialog").clientWidth'),true,'Mobile editor overflow');
+    const editor=await send('Page.captureScreenshot',{format:'png'});
+    await writeFile('test-results/demo-mobile-editor.png',Buffer.from(editor.data,'base64'));
+    await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
+  }
   assert.deepEqual(errors,[],'Browser JavaScript exceptions');
-  console.log(`PASS: ${snapshotOnly?'real telemetry and responsive layout':'automatic discovery, identification at 100%, slider at 70%, restoration, naming, rescan, curve dragging, save, activation, reload persistence and responsive layout'}`);
+  console.log(`PASS: ${snapshotOnly?'read-only telemetry and responsive layout':'identification and restoration, independent sources, shared curves, drag/cancel/apply, manual slider, control switch, settings, offline CRUD, curve copy/delete, edit conflict, reload and desktop/mobile layouts'}; theme persistence and 320/768/1024px navigation layouts`);
 }finally{
   socket?.close();
   browser.kill('SIGTERM');
