@@ -251,7 +251,7 @@ class Engine:
                 tach = rpm.get(f["rpm_sensor_id"])
                 active_since = memory.get("active_since", now)
                 tach_sensor = next((s for s in fans if s["id"] == f["rpm_sensor_id"]), {})
-                if (f["id"] in self.enabled and now - active_since > 10 and f["rpm_sensor_id"]
+                if (f["id"] in self.enabled and duty > 0 and now - active_since > 10 and f["rpm_sensor_id"]
                         and tach_sensor.get("rpm_is_feedback", True) and (tach is None or tach <= 0)):
                     duty, fault = 100, "测速信号丢失或风扇停转，保护输出 100%"
                     requested = 100
@@ -356,6 +356,8 @@ class Engine:
             # Remove only the exact, untouched placeholders shipped in 0.1.
             placeholders = [default_fan("cpu-fan", "CPU 散热风扇", "@cpu"),
                             default_fan("case-fan", "机箱风扇", "@cpu-gpu")]
+            for f in placeholders:
+                f.update(points=[[25, 30], [40, 35], [55, 50], [70, 75], [85, 100]], min_duty=30)
             config["fans"] = [f for f in config["fans"] if f not in placeholders]
             bound = {f["channel_id"] for f in config["fans"]}
             added = 0
@@ -544,6 +546,21 @@ class Engine:
             fan.update(changes)
             self.update_config(config)
 
+    def reorder_fans(self, ids, expected=None):
+        with self.lock:
+            current = [f["id"] for f in self.config["fans"]]
+            if (not isinstance(ids, list) or any(not isinstance(id_, str) for id_ in ids)
+                    or len(ids) != len(current) or set(ids) != set(current)):
+                raise ValueError("排序必须包含当前所有风扇，且不能重复")
+            if expected is not None and expected != current:
+                raise ConfigConflict("风扇顺序已更新，请刷新后重试")
+            config = copy.deepcopy(self.config)
+            fans = {f["id"]: f for f in config["fans"]}
+            config["fans"] = [fans[id_] for id_ in ids]
+            save_config(self.config_path, config)
+            self.config = config
+            self.event("风扇卡片顺序已保存")
+
     def save_curve(self, curve, expected=None, assign_to=None, expected_fan=None):
         with self.lock:
             if not isinstance(curve, dict):
@@ -602,9 +619,12 @@ class Engine:
                 raise ValueError("请先绑定一个在线控制通道")
             if not channel["writable"]:
                 raise ValueError(channel["reason"])
-            # A zero curve should retain native automatic control without a
-            # needless full-speed pulse when enabling or restarting control.
-            initial = 0 if self.snapshot["outputs"][id_]["automatic"] else 100
+            # Start at 50% within the configured and hardware output bounds.
+            # Faults take priority; a zero GPU curve retains native automatic control.
+            output = self.snapshot["outputs"][id_]
+            low = max(f["min_duty"], channel.get("min_duty", 0))
+            high = max(low, min(f["max_duty"], channel.get("max_duty", 100)))
+            initial = 0 if output["automatic"] else 100 if output["fault"] else max(low, min(high, 50))
             lease = self.hardware.acquire(f["channel_id"], initial)
             self.leases[id_] = lease
             self.enabled.add(id_)
