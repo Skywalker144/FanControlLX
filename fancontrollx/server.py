@@ -107,7 +107,14 @@ class Handler(BaseHTTPRequestHandler):
             path = urlsplit(self.path).path
             result = {}
             if path == "/api/config":
-                engine.update_config(value)
+                engine.update_config(value, value.get("expected_revision"))
+            elif path == "/api/fan":
+                engine.patch_fan(value.get("id"), value.get("changes"), value.get("expected"))
+            elif path == "/api/curve":
+                result["id"] = engine.save_curve(value.get("curve"), value.get("expected"),
+                                                  value.get("assign_to"), value.get("expected_fan"))
+            elif path == "/api/curve/delete":
+                engine.delete_curve(value.get("id"), value.get("expected"))
             elif path == "/api/scan":
                 result["added"] = engine.scan_connected()
             elif path == "/api/identify":
