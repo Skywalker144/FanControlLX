@@ -166,15 +166,16 @@ header .badge { border: 0; background: transparent; margin-right: 6px; }
 .fan-card .card-top { gap: 8px; margin-bottom: 16px; }
 .fan-card .fan-symbol { width: 30px; height: 30px; border-radius: 9px; }
 .status-control { gap: 7px; padding: 5px 7px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
-.status-control .status-tag { font-size: 10px; padding: 0; border: 0; background: transparent; }
+.status-control .status-tag { width: 6.9em; justify-content: flex-end; font-size: 10px; padding: 0; border: 0; background: transparent; }
 .status-control:has(input:checked) { background: var(--accent-soft); border-color: transparent; }
 .status-control:has(.fault) { background: var(--warn-soft); }
-.fan-values { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; margin-bottom: 13px; font-variant-numeric: tabular-nums; }
-.value-label { display: block; font-size: 10px; color: var(--muted); margin-bottom: 2px; }
+.fan-values { display: grid; grid-template-columns: minmax(0,1fr) max-content; align-items: end; gap: 8px; margin-bottom: 13px; font-variant-numeric: tabular-nums; }
+.value-label { display: block; font-size: 10px; color: var(--muted); margin-bottom: 2px; white-space: nowrap; }
 .target-reading { display: inline-block; margin-left: 9px; color: var(--accent); }
+.output-reading { display: flex; align-items: baseline; white-space: nowrap; }
 .fan-values strong { font-size: 34px; line-height: 1.25; letter-spacing: -1px; font-weight: 500; }
 .fan-values small { font-size: 10px; margin-left: 5px; }
-.fan-values .reading { font-size: 11px; color: var(--muted); text-align: right; line-height: 1.9; }
+.fan-values .reading { font-size: 11px; color: var(--muted); text-align: right; line-height: 1.9; white-space: nowrap; }
 .fan-values .reading span { color: var(--text); font-weight: 500; }
 .progress { height: 4px; border-radius: 4px; background: var(--tray); overflow: hidden; margin-bottom: 14px; }
 .progress i { display: block; height: 100%; border-radius: inherit; background: var(--accent); opacity: .55; transition: width .5s var(--ease); }
@@ -203,9 +204,9 @@ input[type=checkbox] { accent-color: var(--accent); }
 .preview-caption>span:last-child { display: inline-flex; align-items: center; gap: 4px; color: var(--accent); white-space: nowrap; }
 .preview-caption .ui-icon { width: 12px; height: 12px; }
 .card-footer { margin-top: auto; display: flex; align-items: center; justify-content: space-between; gap: 8px; border-top: 1px solid var(--line); padding-top: 7px; }
-.card-footer .hint { font-size: 10px; margin: 0; }
+.card-footer .hint { min-width: 0; min-height: 3.6em; display: flex; align-items: center; font-size: 10px; margin: 0; }
 .card-footer .toolbar { gap: 3px; flex-wrap: nowrap; flex-shrink: 0; }
-.card-feedback { font-size: 10px; color: var(--muted); margin-top: 7px; }
+.card-feedback { min-height: 3.2em; font-size: 10px; line-height: 1.6; color: var(--muted); margin-top: 7px; overflow-wrap: anywhere; }
 .card-feedback.error,.inline-error { color: var(--danger); }
 .control-toggle { display: flex; align-items: center; gap: 8px; margin: 0; color: var(--text); font-size: 11px; flex-shrink: 0; }
 .control-toggle input { appearance: none; width: 30px; height: 18px; background: color-mix(in srgb,var(--muted) 35%,var(--panel)); border-radius: 20px; position: relative; cursor: pointer; margin: 0; transition: background 180ms; }
