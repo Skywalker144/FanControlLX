@@ -43,6 +43,10 @@ try{
     return result.result.value;
   };
   const waitFor=async expression=>{const deadline=Date.now()+10000;while(Date.now()<deadline){if(await evaluate(expression))return;await new Promise(resolve=>setTimeout(resolve,120));}throw new Error(`Wait timed out: ${expression}`);};
+  const editorFits=async label=>{
+    const layout=await evaluate(`(()=>{const d=document.getElementById('curve-dialog'),b=d.getBoundingClientRect();return{fits:d.scrollHeight<=d.clientHeight+1&&d.scrollWidth<=d.clientWidth+1&&b.top>=0&&b.bottom<=innerHeight,height:d.clientHeight,scrollHeight:d.scrollHeight,parts:Array.from(d.querySelector('form').children).map(el=>[el.className,el.getBoundingClientRect().height])}})()`);
+    assert.equal(layout.fits,true,`Curve editor must fit without scrolling: ${label}: ${JSON.stringify(layout)}`);
+  };
   const reloadPage=async()=>{
     const loaded=new Promise((resolve,reject)=>{
       const onLoad=event=>{
@@ -65,13 +69,48 @@ try{
     await waitFor('document.querySelectorAll("[data-fan]").length===3');
     await evaluate(`document.querySelector('[data-create-curve]').click()`);
     await waitFor('document.getElementById("curve-dialog").open');
+    assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll('[data-point][data-axis="0"]')).map(el=>[Number(el.value),Number(document.querySelector('[data-point="'+el.dataset.point+'"][data-axis="1"]').value)])`),[[30,20],[50,50],[80,100]]);
+    for(const [width,height] of [[1440,900],[1280,720],[1024,600],[768,900],[390,844],[320,640]]){
+      await send('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width<580});
+      await editorFits(`${width} × ${height}`);
+      assert.equal(await evaluate(`(()=>{const widths=Array.from(document.querySelectorAll('.fan-card:first-child .card-controls .mode-control,.fan-card:first-child .card-controls .mode-choice')).map(el=>el.getBoundingClientRect().width);return widths.length===3&&Math.max(...widths)-Math.min(...widths)<1})()`),true,`Equal control widths at ${width}px`);
+      assert.equal(await evaluate(`document.querySelector('.mode-buttons').children.length`),2,'Curve and manual share one segmented control');
+    }
+    await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
     await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
     const saved=()=>evaluate('(async()=> (await(await fetch("/api/state")).json()).config)()');
     const config=await saved();
     assert.equal(config.fans.length,3);
+    assert.equal(config.fans[0].min_duty,0);
+    assert.deepEqual(config.fans[0].points,[[30,20],[50,50],[80,100]]);
     const first=config.fans[0].id,second=config.fans[1].id;
     const card=id=>`document.querySelector('[data-fan="${id}"]')`;
     const post=async(path,body)=>evaluate(`(async()=>{const s=await(await fetch('/api/state')).json();const r=await fetch(${JSON.stringify(path)},{method:'POST',headers:{'Content-Type':'application/json','X-FanControl-Token':s.csrf_token},body:JSON.stringify(${JSON.stringify(body)})});if(!r.ok)throw new Error(await r.text());return r.json()})()`);
+    const drag=await evaluate(`(()=>{const a=${card(first)}.querySelector('[data-drag-handle]').getBoundingClientRect(),b=${card(second)}.getBoundingClientRect();return{from:{x:a.x+a.width/2,y:a.y+a.height/2},to:{x:b.x+b.width/2,y:b.y+b.height/2}}})()`);
+    await send('Input.dispatchMouseEvent',{type:'mousePressed',...drag.from,button:'left',clickCount:1});
+    await send('Input.dispatchMouseEvent',{type:'mouseMoved',...drag.to,buttons:1});
+    await send('Input.dispatchMouseEvent',{type:'mouseReleased',...drag.to,button:'left',clickCount:1});
+    await waitFor(`(async()=> (await(await fetch('/api/state')).json()).config.fans[0].id===${JSON.stringify(second)})()`);
+    await reloadPage();
+    await waitFor(`document.querySelector('[data-fan]')?.dataset.fan===${JSON.stringify(second)}`);
+    await evaluate(`${card(first)}.querySelector('[data-drag-handle]').focus()`);
+    await send('Input.dispatchKeyEvent',{type:'keyDown',key:'ArrowLeft',code:'ArrowLeft',modifiers:1});
+    await send('Input.dispatchKeyEvent',{type:'keyUp',key:'ArrowLeft',code:'ArrowLeft'});
+    await waitFor(`(async()=> (await(await fetch('/api/state')).json()).config.fans[0].id===${JSON.stringify(first)})()`);
+    await waitFor(`document.querySelector('[data-fan]')?.dataset.fan===${JSON.stringify(first)}`);
+    await send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+    await send('Emulation.setTouchEmulationEnabled',{enabled:true,maxTouchPoints:1});
+    await evaluate(`${card(first)}.scrollIntoView({block:'start'});window.scrollBy(0,-60)`);
+    const touch=await evaluate(`(()=>{const a=${card(first)}.querySelector('[data-drag-handle]').getBoundingClientRect(),b=${card(second)}.getBoundingClientRect();return{from:{x:a.x+a.width/2,y:a.y+a.height/2},to:{x:b.x+b.width/2,y:b.y+30}}})()`);
+    await send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[touch.from]});
+    await send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[touch.to]});
+    await send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
+    await waitFor(`(async()=> (await(await fetch('/api/state')).json()).config.fans[0].id===${JSON.stringify(second)})()`);
+    await post('/api/fan-order',{ids:config.fans.map(f=>f.id)});
+    await waitFor(`document.querySelector('[data-fan]')?.dataset.fan===${JSON.stringify(first)}`);
+    await send('Emulation.setTouchEmulationEnabled',{enabled:false});
+    await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+    await evaluate('window.scrollTo(0,0)');
     await evaluate(`document.querySelector('[data-tab="devices"]').click();document.querySelector('#discovered-fans [data-identify]').click()`);
     await waitFor('document.getElementById("identify-dialog").open');
     await evaluate(`document.getElementById('identify-kind').value='fan';document.getElementById('identify-kind').dispatchEvent(new Event('change'));document.getElementById('identify-full').click()`);
@@ -90,7 +129,17 @@ try{
     const initialPoints=JSON.stringify((await saved()).fans[0].points);
     await evaluate(`${card(first)}.querySelector('[data-edit-curve]').click()`);
     await waitFor('document.getElementById("curve-dialog").open');
+    assert.equal(await evaluate(`${card(first)}.querySelector('[data-edit-curve] svg[role="img"]')!==null`),true,'Card thumbnail opens curve editor');
+    assert.equal(await evaluate(`${card(first)}.querySelector('.card-top [data-toggle]')!==null`),true,'Control toggle is in card header');
+    assert.equal(await evaluate(`${card(first)}.querySelector('.fan-values [data-live="target"]')!==null`),true,'Target stays next to actual output');
     await evaluate(`document.getElementById('preset').value='quiet';document.getElementById('preset').dispatchEvent(new Event('change'))`);
+    assert.equal(await evaluate(`document.querySelectorAll('#point-list .point').length`),5,'All nodes are listed together');
+    assert.equal(await evaluate(`document.querySelector('.point-pagination')===null`),true,'Node pagination is removed');
+    await editorFits('five nodes');
+    await send('Emulation.setDeviceMetricsOverride',{width:320,height:640,deviceScaleFactor:1,mobile:true});
+    await editorFits('five independent nodes with sharing option at 320 × 640');
+    await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+    await evaluate(`document.getElementById('point-list').scrollTop=0`);
     await evaluate(`document.getElementById('curve-chart').scrollIntoView({block:'center'})`);
     const box=await evaluate(`(()=>{const b=document.querySelector('#curve-chart [data-node="2"]').getBoundingClientRect();return{x:b.x+b.width/2,y:b.y+b.height/2}})()`);
     await send('Input.dispatchMouseEvent',{type:'mousePressed',x:box.x,y:box.y,button:'left',clickCount:1});
@@ -118,6 +167,14 @@ try{
     await waitFor(`${card(first)}.querySelector('[data-manual]')?.disabled===false`);
     await evaluate(`${card(first)}.querySelector('[data-manual]').value=67;${card(first)}.querySelector('[data-manual]').dispatchEvent(new Event('input',{bubbles:true}));${card(first)}.querySelector('[data-manual]').dispatchEvent(new Event('change',{bubbles:true}))`);
     await waitFor(`(async()=> (await(await fetch('/api/state')).json()).config.fans[0].manual_duty===67)()`);
+    await waitFor(`${card(first)}.querySelector('[data-field="curve_id"]').disabled===false`);
+    assert.equal(await evaluate(`${card(first)}.querySelector('[data-field="curve_id"]').value`),'@manual');
+    await evaluate(`${card(first)}.querySelector('[data-field="curve_id"]').value=${JSON.stringify(curve.id)};${card(first)}.querySelector('[data-field="curve_id"]').dispatchEvent(new Event('change',{bubbles:true}))`);
+    await waitFor(`(async()=>{const f=(await(await fetch('/api/state')).json()).config.fans[0];return f.mode==='curve'&&f.curve_id===${JSON.stringify(curve.id)}})()`);
+    await waitFor(`${card(first)}.querySelector('[data-mode="manual"]').disabled===false`);
+    await evaluate(`${card(first)}.querySelector('[data-mode="manual"]').click()`);
+    await waitFor(`${card(first)}.querySelector('[data-manual]')?.disabled===false`);
+    assert.equal((await saved()).fans[0].manual_duty,67,'Mode changes preserve manual output');
     await waitFor(`${card(first)}.querySelector('[data-toggle]').disabled===false`);
     await evaluate(`${card(first)}.querySelector('[data-toggle]').click()`);
     await waitFor(`(async()=> (await(await fetch('/api/state')).json()).outputs[${JSON.stringify(first)}].active)()`);
@@ -125,6 +182,9 @@ try{
     await evaluate(`${card(first)}.querySelector('[data-device]').click();document.getElementById('min-duty').value=35;document.getElementById('min-duty').dispatchEvent(new Event('input',{bubbles:true}));document.getElementById('device-form').requestSubmit()`);
     await waitFor('!document.getElementById("device-dialog").open');
     assert.equal((await saved()).fans[0].min_duty,35);
+    await evaluate(`${card(first)}.querySelector('[data-device]').click();document.getElementById('min-duty').value=0;document.getElementById('min-duty').dispatchEvent(new Event('input',{bubbles:true}));document.getElementById('device-form').requestSubmit()`);
+    await waitFor('!document.getElementById("device-dialog").open');
+    assert.equal((await saved()).fans[0].min_duty,0,'Zero minimum saves through settings');
     await evaluate(`document.querySelector('[data-tab="devices"]').click();document.querySelector('#discovered-fans [data-identify]').click();document.getElementById('identify-full').click()`);
     await waitFor(`document.getElementById('identify-test-status').textContent.includes('正在以 100%')`);
     await evaluate(`document.getElementById('identify-close').click()`);
@@ -158,6 +218,26 @@ try{
     await waitFor(`${card(first)}?.querySelector('[data-manual]')?.value==='67'`);
     assert.deepEqual((await saved()).fans.slice(0,2).map(f=>f.sensor_ids),[['@gpu'],['@cpu-gpu']]);
     assert.equal((await saved()).curves.find(c=>c.id===curve.id).name,'来自另一页面');
+    const many=await post('/api/curve',{curve:{name:'滚动测试',points:Array.from({length:32},(_,i)=>[i*3,Math.min(100,i*4)])}});
+    await waitFor(`document.querySelector('[data-library-edit="${many.id}"]')!==null`);
+    await evaluate(`document.querySelector('[data-library-edit="${many.id}"]').click()`);
+    assert.equal(await evaluate(`document.querySelectorAll('#point-list .point').length`),32,'All 32 nodes are rendered without pagination');
+    for(const [width,height] of [[1440,900],[1024,600],[390,844],[320,640]]){
+      await send('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width<580});
+      await editorFits(`32 scrollable nodes at ${width} × ${height}`);
+      assert.equal(await evaluate(`(()=>{const list=document.getElementById('point-list');return list.scrollHeight>list.clientHeight})()`),true,'Only the node list scrolls');
+      const before=await evaluate(`['curve-chart','save-curve'].map(id=>document.getElementById(id).getBoundingClientRect().top)`);
+      await evaluate(`document.getElementById('point-list').scrollTop=document.getElementById('point-list').scrollHeight`);
+      assert.equal(await evaluate(`(()=>{const list=document.getElementById('point-list').getBoundingClientRect(),last=document.querySelector('[data-point="31"]').closest('.point').getBoundingClientRect();return last.top>=list.top-1&&last.bottom<=list.bottom+1})()`),true,'Scrolling reaches the final node');
+      assert.deepEqual(await evaluate(`['curve-chart','save-curve'].map(id=>document.getElementById(id).getBoundingClientRect().top)`),before,'Graph and save button stay fixed while scrolling nodes');
+    }
+    await evaluate(`document.getElementById('point-list').scrollTop=0;const node=document.querySelector('#curve-chart [data-node="31"]');node.focus({preventScroll:true});node.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true}))`);
+    assert.equal(await evaluate(`document.getElementById('point-list').scrollTop>0`),true,'Selecting a graph node reveals its list entry');
+    await evaluate(`const input=document.querySelector('[data-point="31"][data-axis="1"]');input.value=98;input.dispatchEvent(new Event('change',{bubbles:true}))`);
+    assert.equal(await evaluate(`document.getElementById('point-list').scrollTop>0&&document.querySelector('[data-point="31"][data-axis="1"]').value==='98'`),true,'Editing preserves the scrolled node position');
+    await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+    await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
+    await post('/api/curve/delete',{id:many.id});
     for(const name of ['sensors','diagnostics','devices','control'])await evaluate(`document.querySelector('[data-tab="${name}"]').click()`);
   }
   await mkdir('test-results',{recursive:true});
@@ -201,6 +281,7 @@ try{
     await send('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});
     assert.equal(await evaluate(`getComputedStyle(document.getElementById('curve-dialog')).animationName`),'none');
     assert.equal(await evaluate('document.getElementById("curve-dialog").scrollWidth <= document.getElementById("curve-dialog").clientWidth'),true,'Mobile editor overflow');
+    await editorFits('mobile with shared curve');
     const editor=await send('Page.captureScreenshot',{format:'png'});
     await writeFile('test-results/demo-mobile-editor.png',Buffer.from(editor.data,'base64'));
     await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
@@ -257,7 +338,7 @@ try{
     await reloadPage();
   }
   assert.deepEqual(errors,[],'Browser JavaScript exceptions');
-  console.log(`PASS: ${snapshotOnly?'read-only telemetry and responsive layout':'identification and restoration, independent sources, shared curves, drag/cancel/apply, manual slider, control switch, settings, offline CRUD, curve copy/delete, edit conflict, reload and desktop/mobile layouts'}; theme persistence and 320/768/1024px navigation layouts${snapshotOnly?'':'; NVIDIA zero RPM discovery, source selection, driver bounds, zero-curve automatic status and protection'}`);
+  console.log(`PASS: ${snapshotOnly?'read-only telemetry and responsive layout':'identification and restoration, independent sources, shared curves, drag/cancel/apply, manual slider, control switch, zero minimum, offline CRUD, curve copy/delete, edit conflict, mouse/touch/keyboard card reorder and persistence, independently scrolling nodes, fixed graph/actions and desktop/mobile layouts'}; theme persistence and 320/768/1024px navigation layouts${snapshotOnly?'':'; NVIDIA zero RPM discovery, source selection, driver bounds, zero-curve automatic status and protection'}`);
 }finally{
   socket?.close();
   browser.kill('SIGTERM');
