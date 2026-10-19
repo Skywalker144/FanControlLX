@@ -52,6 +52,31 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIs(self.engine.leases[self.second], lease)
         self.assertIn(self.second, self.engine.enabled)
 
+    def test_card_order_persists_without_reacquiring_or_overwriting_fan_settings(self):
+        self.engine.activate(self.second)
+        lease = self.engine.leases[self.second]
+        before = copy.deepcopy(self.engine.config['fans'])
+        ids = [f['id'] for f in before]
+        self.engine.patch_fan(self.first, {'manual_duty': 72})
+        self.hw.writes.clear()
+        self.engine.reorder_fans(list(reversed(ids)), expected=ids)
+        self.assertEqual([f['id'] for f in self.engine.config['fans']], list(reversed(ids)))
+        self.assertEqual(next(f for f in self.engine.config['fans'] if f['id'] == self.first)['manual_duty'], 72)
+        self.assertIs(self.engine.leases[self.second], lease)
+        self.assertEqual(self.hw.writes, [])
+        self.assertEqual(json.loads(self.path.read_text()), self.engine.config)
+
+    def test_invalid_and_conflicting_card_orders_preserve_config(self):
+        before = copy.deepcopy(self.engine.config)
+        ids = [f['id'] for f in before['fans']]
+        for order in (None, ids[:-1], ids + [ids[0]], [ids[0]] * len(ids), [*ids[:-1], 'missing']):
+            with self.subTest(order=order), self.assertRaises(ValueError):
+                self.engine.reorder_fans(order)
+            self.assertEqual(self.engine.config, before)
+        with self.assertRaises(ConfigConflict):
+            self.engine.reorder_fans(list(reversed(ids)), expected=list(reversed(ids)))
+        self.assertEqual(self.engine.config, before)
+
     def test_stale_fan_curve_and_import_edits_cannot_overwrite_newer_changes(self):
         original = self.engine.config['fans'][0]['name']
         self.engine.patch_fan(self.first, {'name': '新名称'})
@@ -212,6 +237,15 @@ class WorkspaceHTTPTests(unittest.TestCase):
     setUp = test_core.HTTPTests.setUp
     cleanup = test_core.HTTPTests.cleanup
     request = test_core.HTTPTests.request
+
+    def test_card_order_endpoint_checks_token_ids_and_concurrent_order(self):
+        ids = [f['id'] for f in self.engine.config['fans']]
+        headers = {'Content-Type': 'application/json', 'X-FanControl-Token': self.server.csrf}
+        body = {'ids': list(reversed(ids)), 'expected': ids}
+        self.assertEqual(self.request('POST', '/api/fan-order', body, {'Content-Type': 'application/json'})[0], 403)
+        self.assertEqual(self.request('POST', '/api/fan-order', body, headers)[0], 200)
+        self.assertEqual(self.request('POST', '/api/fan-order', body, headers)[0], 409)
+        self.assertEqual(self.request('POST', '/api/fan-order', {'ids': ids[:-1]}, headers)[0], 400)
 
     def test_scoped_fan_and_curve_endpoints_require_tokens_and_report_conflicts(self):
         headers = {'Content-Type': 'application/json', 'X-FanControl-Token': self.server.csrf}
