@@ -93,30 +93,42 @@ function renderFanCards(){
     if(cardSignatures.get(f.id)!==signature&&!editingRanges.has(f.id)&&!fanDrag){
       cardSignatures.set(f.id,signature);
       el.innerHTML=`<div class="card-top"><button class="fan-symbol fan-drag-handle" data-drag-handle aria-label="拖动 ${esc(f.name)} 排序；Alt 加方向键调整顺序" title="拖动排序 · Alt + 方向键" ${disabled||orderSaving?'disabled':''}>${icon('fan')}</button><div class="card-name"><h3>${esc(f.name)}</h3><div class="chip-label">${esc(c?`${c.chip} · ${c.name}`:f.channel_id?'已绑定通道离线':'离线配置')}</div></div><label class="control-toggle status-control"><span class="status-tag" data-live="status"></span><input type="checkbox" data-toggle aria-label="${esc(f.name)} 启用控制" title="启用控制" ${requested?'checked':''} ${disabled||!state.control_allowed||(!requested&&(!f.identified||!c?.writable))?'disabled':''}></label></div>
-        <div class="fan-values"><div><span class="value-label">当前输出 <span class="target-reading">目标 <span data-live="target">—</span>%</span></span><strong data-live="actual">—</strong><small>% 输出</small></div><div class="reading"><span data-live="rpm">—</span> RPM<br><span data-live="temperature">—</span> °C 输入</div></div><div class="progress"><i data-live="progress"></i></div>
+        <div class="fan-values"><div><span class="value-label">当前输出 <span class="target-reading">目标 <span data-live="target">—</span>%</span></span><div class="output-reading"><strong data-live="actual">—</strong><small>% 输出</small></div></div><div class="reading"><span data-live="rpm">—</span> RPM<br><span data-live="temperature">—</span> °C 输入</div></div><div class="progress"><i data-live="progress"></i></div>
         <div class="card-controls"><div class="mode-buttons" role="group" aria-label="${esc(f.name)} 控制方式"><label class="mode-control curve-mode-control ${f.mode==='curve'?'selected':''}" title="曲线模式 · 选择曲线"><select data-field="curve_id" aria-label="${esc(f.name)} 曲线模式与曲线选择" ${disabled?'disabled':''}>${curveOptions(f)}</select></label><button class="mode-choice ${f.mode==='manual'?'selected':''}" data-mode="manual" aria-pressed="${f.mode==='manual'}" ${disabled?'disabled':''}>手动</button></div><label class="mode-control source-mode-control" title="温度源">${icon('activity')}<select data-field="source" aria-label="${esc(f.name)} 温度源" ${disabled?'disabled':''}>${sourceOptions(f)}</select></label></div>
         <div class="manual-field" ${f.mode==='manual'?'':'hidden'}><div class="slider-label"><label for="manual-${esc(f.id)}">手动输出</label><output data-live="manual">${fmt(Math.max(low,Math.min(high,f.manual_duty)))}%</output></div><input id="manual-${esc(f.id)}" data-manual type="range" min="${low}" max="${high}" step="1" value="${Math.max(low,Math.min(high,f.manual_duty))}" aria-label="${esc(f.name)} 手动输出" ${disabled?'disabled':''}><div class="hint">${fmt(low)}–${fmt(high)}% · 松开即保存，按升降速限制调整</div></div>
-        <button class="fan-curve-preview" data-edit-curve aria-label="编辑 ${esc(f.name)} 的曲线" ${disabled?'disabled':''}>${miniCurve(pointsFor(f))}<span class="preview-caption"><span>${pointsFor(f).length} 个节点${f.mode==='manual'?' · 手动模式，曲线未使用':''}</span><span>${icon('curve')}编辑曲线 ↗</span></span></button>
+        <button class="fan-curve-preview" data-edit-curve aria-label="编辑 ${esc(f.name)} 的曲线" ${disabled?'disabled':''}>${miniCurve(pointsFor(f),true)}<span class="preview-caption"><span>${pointsFor(f).length} 个节点${f.mode==='manual'?' · 手动模式，曲线未使用':''}</span><span>${icon('curve')}编辑曲线 ↗</span></span></button>
         <div class="card-footer"><span class="hint" data-live="policy"></span><div class="toolbar">${!f.identified&&c?`<button class="text-button" data-identify="${esc(c.id)}" ${disabled?'disabled':''}>确认设备</button>`:''}<button class="text-button" data-device ${disabled?'disabled':''}>${icon('settings')}设置</button></div></div><p class="card-feedback" data-live="feedback" role="status"></p>`;
     }
     const live=(key,value)=>{const target=el.querySelector(`[data-live="${key}"]`);if(target)target.textContent=value;};
     const status=!connected?'连接中断':testing?'测试辨认中':state.pending_autostart?.[f.id]?'等待设备就绪':o.active?(o.fault?'保护运行':o.automatic?'显卡自动调速':'正在控制'):!f.identified?'待确认设备':c?'未启用控制':f.channel_id?'通道离线':'离线配置';
     el.classList.toggle('is-active',connected&&!!o.active);el.classList.toggle('has-fault',connected&&!!o.active&&!!o.fault);live('status',status);el.querySelector('[data-live="status"]').className=`status-tag ${connected&&o.active?'active':''} ${connected&&o.fault&&o.active?'fault':''}`;
     live('actual',connected?fmt(o.actual,1):'—');live('target',connected?fmt(o.requested??o.target,1):'—');live('rpm',connected?fmt(o.rpm):'—');live('temperature',connected?fmt(o.temperature,1):'—');
+    updateMiniCurve(el.querySelector('.fan-curve-preview>svg'),pointsFor(f),connected?o.temperature:null,f.mode);
     el.querySelector('[data-live="progress"]').style.width=`${connected?Math.max(0,Math.min(100,o.actual||0)):0}%`;
     live('policy',o.active&&o.automatic?'曲线 0% · 显卡自动调速':requested?(state.background_service?'已保存 · 开机恢复':'本次运行有效'):c?.backend==='nvidia'?(c.mode===0?'显卡自动调速':'显卡原手动模式'):'保持原硬件控制');
     const message=cardMessages.get(f.id);const fault=connected&&o.active?o.fault:null;
     live('feedback',!connected?'读数已过期':pendingFans.has(f.id)?'正在应用…':fault||state.pending_autostart?.[f.id]||(o.active&&o.automatic?'由显卡决定转速与停转；曲线升高后自动接管':message?.text)||(o.active&&Math.abs((o.requested??o.target)-o.target)>1?'正在平滑调整':''));
-    el.querySelector('[data-live="feedback"]').hidden=!el.querySelector('[data-live="feedback"]').textContent;
     el.querySelector('[data-live="feedback"]').classList.toggle('error',!!fault||!!message?.error);
   }
   if(!ids.size)$('fan-cards').innerHTML='<div class="empty">还没有风扇配置。<br><button class="button secondary" data-tab="devices">前往设备设置</button></div>';
 }
-function miniCurve(points){
+function updateMiniCurve(svg,points,temperature,mode){
+  const marker=svg.querySelector('[data-curve-current]'),available=Number.isFinite(temperature);
+  marker.setAttribute('visibility',available?'visible':'hidden');
+  if(!available){svg.setAttribute('aria-label','曲线预览：当前温度不可用');return;}
+  const low=Math.min(20,points[0][0]),high=Math.max(100,points.at(-1)[0]);
+  const duty=interpolate(points,temperature),x=12+(Math.max(low,Math.min(high,temperature))-low)/(high-low)*236;
+  marker.setAttribute('transform',`translate(${x} 0)`);
+  marker.querySelector('circle').setAttribute('cy',64-duty*.52);
+  const reading=`当前温度 ${fmt(temperature,1)}°C · ${mode==='manual'?'曲线参考输出':'曲线目标输出'} ${fmt(duty,1)}%${mode==='manual'?'（手动模式，曲线未使用）':''}`;
+  marker.querySelector('title').textContent=reading;
+  svg.setAttribute('aria-label',`曲线预览：${reading}`);
+}
+function miniCurve(points,live=false){
   const low=Math.min(20,points[0][0]),high=Math.max(100,points.at(-1)[0]);
   const xy=([t,d])=>[12+(t-low)/(high-low)*236,64-d*.52];
   const coords=[[12,xy(points[0])[1]],...points.map(xy),[248,xy(points.at(-1))[1]]].map(p=>p.join(',')).join(' ');
-  return `<svg viewBox="0 0 260 80" role="img" aria-label="曲线预览：${points.map(([t,d])=>`${t}°C ${d}%`).join('，')}"><path d="M12,12H248M12,38H248M12,64H248" stroke="var(--line)" stroke-dasharray="2 4" fill="none"/><polygon points="12,64 ${coords} 248,64" fill="var(--accent)" opacity=".08"/><polyline points="${coords}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>${points.map(p=>{const [x,y]=xy(p);return `<circle cx="${x}" cy="${y}" r="3" fill="var(--panel)" stroke="var(--accent)" stroke-width="1.5"/>`;}).join('')}<g fill="var(--muted)" font-size="8"><text x="12" y="77">${low}°</text><text x="248" y="77" text-anchor="end">${high}°C</text><text x="248" y="8" text-anchor="end">100%</text></g></svg>`;
+  return `<svg viewBox="0 0 260 80" role="img" aria-label="曲线预览：${points.map(([t,d])=>`${t}°C ${d}%`).join('，')}"><path d="M12,12H248M12,38H248M12,64H248" stroke="var(--line)" stroke-dasharray="2 4" fill="none"/><polygon points="12,64 ${coords} 248,64" fill="var(--accent)" opacity=".08"/><polyline points="${coords}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>${points.map(p=>{const [x,y]=xy(p);return `<circle cx="${x}" cy="${y}" r="3" fill="var(--panel)" stroke="var(--accent)" stroke-width="1.5"/>`;}).join('')}${live?'<g data-curve-current visibility="hidden"><title></title><line x1="0" y1="12" x2="0" y2="64" stroke="var(--blue)" stroke-width="1.5" stroke-dasharray="3 3"/><circle cx="0" cy="64" r="4" fill="var(--blue)" stroke="var(--panel)" stroke-width="1.5"/></g>':''}<g fill="var(--muted)" font-size="8"><text x="12" y="77">${low}°</text><text x="248" y="77" text-anchor="end">${high}°C</text><text x="248" y="8" text-anchor="end">100%</text></g></svg>`;
 }
 function renderLibrary(){
   const signature=JSON.stringify([state.config.curves,state.config.fans.map(f=>[f.curve_id,f.name]),editable()]);if(signature===librarySignature)return;librarySignature=signature;
