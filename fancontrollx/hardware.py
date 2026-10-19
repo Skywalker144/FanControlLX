@@ -10,6 +10,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from .nvidia import NvidiaBackend
+
 # These use 1=manual and 2=firmware automatic. Unknown drivers remain read-only.
 SUPPORTED = {"nct6687", "nct6775", "nct6776", "nct6779", "nct6791", "nct6792",
              "nct6793", "nct6795", "nct6796", "nct6797", "nct6798", "nct6799"}
@@ -31,12 +33,15 @@ def read_number(path, scale=1):
 
 
 class Hardware:
-    def __init__(self, root="/sys/class/hwmon"):
+    def __init__(self, root="/sys/class/hwmon", data_dir=None, nvidia=None):
         self.root = Path(root)
         self.paths = {}
         self.gpu_cache = []
         self.gpu_at = -100
         self.gpu_error = None
+        self.nvidia = NvidiaBackend(data_dir) if nvidia is None else nvidia
+        self.nvidia_leases = {}
+        self.gpu_control_error = None
 
     def discover(self):
         sensors, fans, channels, chips = [], [], [], []
@@ -83,7 +88,18 @@ class Hardware:
                 # Retain device paths, not a hwmonX symlink that can be recycled.
                 paths[key] = (p.resolve(), enable.resolve(), (hw / "fan_control_watchdog").resolve())
         self.paths = paths
-        return sensors + self.gpu(), fans, channels, chips
+        gpu_sensors = []
+        if self.nvidia:
+            gpu_sensors, gpu_fans, gpu_channels, gpu_chips = self.nvidia.discover()
+            fans.extend(gpu_fans)
+            channels.extend(gpu_channels)
+            chips.extend(gpu_chips)
+            self.gpu_control_error = self.nvidia.error
+        if gpu_sensors:
+            self.gpu_error = None if all(s["value"] is not None for s in gpu_sensors) else "GPU 温度不可用"
+        else:
+            gpu_sensors = self.gpu()
+        return sensors + gpu_sensors, fans, channels, chips
 
     def gpu(self):
         if time.monotonic() - self.gpu_at < 3:
@@ -109,6 +125,10 @@ class Hardware:
         return self.gpu_cache
 
     def acquire(self, channel_id, duty):
+        if channel_id.startswith("nvidia/"):
+            lease = self.nvidia.acquire(channel_id, duty)
+            self.nvidia_leases[channel_id] = lease
+            return lease
         pwm, enable, watchdog = self.paths[channel_id]
         original = (read_number(pwm), read_number(enable))
         if original[0] is None or original[1] not in (0, 1, 2, 3, 4, 5):
@@ -127,6 +147,11 @@ class Hardware:
         return {"paths": (pwm, enable, watchdog), "original": original, "channel_id": channel_id}
 
     def write(self, channel_id, duty):
+        if channel_id.startswith("nvidia/"):
+            lease = self.nvidia_leases.get(channel_id)
+            if lease is None:
+                raise OSError("NVIDIA 通道尚未接管")
+            return self.nvidia.write(channel_id, duty, lease["token"])
         pwm, _, watchdog = self.paths[channel_id]
         pwm.write_text(f"{round(max(0, min(100, duty)) / 100 * 255)}\n")
         if watchdog.exists():
@@ -145,14 +170,22 @@ class Hardware:
             enable.write_text(f"{round(mode)}\n")
 
     def restore(self, lease):
+        if lease.get("backend") == "nvidia":
+            self.nvidia.restore(lease)
+            self.nvidia_leases.pop(lease["channel_id"], None)
+            return
         paths = self.paths.get(lease["channel_id"], lease["paths"])
         self.restore_paths(paths, lease["original"])
 
     @staticmethod
     def disarm(leases):
-        for path in {lease["paths"][2] for lease in leases}:
+        for path in {lease["paths"][2] for lease in leases if "paths" in lease}:
             if path.exists():
                 path.write_text("0\n")
+
+    def close(self):
+        if self.nvidia:
+            self.nvidia.close()
 
 
 class DemoHardware:
