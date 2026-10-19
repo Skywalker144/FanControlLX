@@ -110,6 +110,8 @@ class Handler(BaseHTTPRequestHandler):
                 engine.update_config(value, value.get("expected_revision"))
             elif path == "/api/fan":
                 engine.patch_fan(value.get("id"), value.get("changes"), value.get("expected"))
+            elif path == "/api/fan-order":
+                engine.reorder_fans(value.get("ids"), value.get("expected"))
             elif path == "/api/curve":
                 result["id"] = engine.save_curve(value.get("curve"), value.get("expected"),
                                                   value.get("assign_to"), value.get("expected_fan"))
