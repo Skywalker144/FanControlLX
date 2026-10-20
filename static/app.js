@@ -1,3 +1,5 @@
+import {interpolate, miniCurve, updateMiniCurve} from './curve.js';
+
 const $ = id => document.getElementById(id);
 const icon = name => `<svg class="ui-icon" aria-hidden="true"><use href="#icon-${name}"></use></svg>`;
 
@@ -27,6 +29,7 @@ let state, connected=false, readSequence=0, appliedSequence=0, currentTab='contr
 let curveEdit=null, deviceEdit=null, identifyingChannel=null, identifyBusy=false, scanBusy=false, dialogSaving=false;
 const pendingFans=new Set(), editingRanges=new Set(), cardSignatures=new Map(), cardMessages=new Map();
 let discoverySignature='', librarySignature='', fanDrag=null, orderSaving=false;
+let lastEditorHeartbeat=0;
 const editable = () => connected && state?.workspace_api===2;
 const findFan = id => state?.config.fans.find(f=>f.id===id);
 const findCurve = id => state?.config.curves?.find(c=>c.id===id);
@@ -46,7 +49,14 @@ async function refresh(){
       for(const row of next.history)history.set(row.time,row);
       next.history=[...history.values()].sort((a,b)=>a.time-b.time).slice(-180);
     }
-    appliedSequence=sequence;state=next;connected=true;if(!document.hidden)render();
+    appliedSequence=sequence;state=next;connected=true;
+    if(!document.hidden){
+      render();
+      if(Date.now()-lastEditorHeartbeat>5000){
+        lastEditorHeartbeat=Date.now();
+        api('/api/editor-heartbeat',{}).catch(()=>{lastEditorHeartbeat=0;});
+      }
+    }
   }catch(error){if(sequence<appliedSequence)return;appliedSequence=sequence;connected=false;if(state)render();else{$('connection-error').hidden=false;$('connection-text').textContent='连接失败';$('service-value').textContent='未连接';}}
 }
 function sourceTemperature(f){
@@ -58,7 +68,6 @@ function sourceTemperature(f){
   if(!values.length)return null;
   return f.aggregation==='average'?values.reduce((a,b)=>a+b,0)/values.length:f.aggregation==='min'?Math.min(...values):Math.max(...values);
 }
-function interpolate(points,t){if(t<=points[0][0])return points[0][1];for(let i=1;i<points.length;i++){const [a,b]=[points[i-1],points[i]];if(t<=b[0])return a[1]+(b[1]-a[1])*(t-a[0])/(b[0]-a[0]);}return points.at(-1)[1];}
 function tab(name){currentTab=name;for(const key of ['control','devices','sensors','diagnostics'])$(`tab-${key}`).hidden=key!==name;document.querySelectorAll('nav [data-tab]').forEach(el=>{el.classList.toggle('active',el.dataset.tab===name);el.setAttribute('aria-current',el.dataset.tab===name?'page':'false');});$('page-title').textContent={control:'风扇控制',devices:'设备设置',sensors:'硬件传感器',diagnostics:'诊断与日志'}[name];if(state)render();}
 function spark(id,kind){const values=state.history.slice(-80);let path='',drawing=false;values.forEach((v,i)=>{if(v[kind]==null){drawing=false;return;}path+=`${drawing?'L':'M'}${i/Math.max(1,values.length-1)*200},${42-Math.max(0,Math.min(100,v[kind]))/100*42} `;drawing=true;});$(id).innerHTML=`<path d="${path}" fill="none" stroke="currentColor" stroke-width="1.7"/>`;}
 function render(){
@@ -122,24 +131,6 @@ function renderFanCards(){
     el.querySelector('[data-live="feedback"]').classList.toggle('error',!!fault||!!message?.error);
   }
   if(!ids.size)$('fan-cards').innerHTML='<div class="empty">还没有风扇配置。<br><button class="button secondary" data-tab="devices">前往设备设置</button></div>';
-}
-function updateMiniCurve(svg,points,temperature,mode){
-  const marker=svg.querySelector('[data-curve-current]'),available=Number.isFinite(temperature);
-  marker.setAttribute('visibility',available?'visible':'hidden');
-  if(!available){svg.setAttribute('aria-label','曲线预览：当前温度不可用');return;}
-  const low=Math.min(20,points[0][0]),high=Math.max(100,points.at(-1)[0]);
-  const duty=interpolate(points,temperature),x=12+(Math.max(low,Math.min(high,temperature))-low)/(high-low)*236;
-  marker.setAttribute('transform',`translate(${x} 0)`);
-  marker.querySelector('circle').setAttribute('cy',64-duty*.52);
-  const reading=`当前温度 ${fmt(temperature,1)}°C · ${mode==='manual'?'曲线参考输出':'曲线目标输出'} ${fmt(duty,1)}%${mode==='manual'?'（手动模式，曲线未使用）':''}`;
-  marker.querySelector('title').textContent=reading;
-  svg.setAttribute('aria-label',`曲线预览：${reading}`);
-}
-function miniCurve(points,live=false){
-  const low=Math.min(20,points[0][0]),high=Math.max(100,points.at(-1)[0]);
-  const xy=([t,d])=>[12+(t-low)/(high-low)*236,64-d*.52];
-  const coords=[[12,xy(points[0])[1]],...points.map(xy),[248,xy(points.at(-1))[1]]].map(p=>p.join(',')).join(' ');
-  return `<svg viewBox="0 0 260 80" role="img" aria-label="曲线预览：${points.map(([t,d])=>`${t}°C ${d}%`).join('，')}"><path d="M12,12H248M12,38H248M12,64H248" stroke="var(--line)" stroke-dasharray="2 4" fill="none"/><polygon points="12,64 ${coords} 248,64" fill="var(--accent)" opacity=".08"/><polyline points="${coords}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>${points.map(p=>{const [x,y]=xy(p);return `<circle cx="${x}" cy="${y}" r="3" fill="var(--panel)" stroke="var(--accent)" stroke-width="1.5"/>`;}).join('')}${live?'<g data-curve-current visibility="hidden"><title></title><line x1="0" y1="12" x2="0" y2="64" stroke="var(--blue)" stroke-width="1.5" stroke-dasharray="3 3"/><circle cx="0" cy="64" r="4" fill="var(--blue)" stroke="var(--panel)" stroke-width="1.5"/></g>':''}<g fill="var(--muted)" font-size="8"><text x="12" y="77">${low}°</text><text x="248" y="77" text-anchor="end">${high}°C</text><text x="248" y="8" text-anchor="end">100%</text></g></svg>`;
 }
 function renderLibrary(){
   const signature=JSON.stringify([state.config.curves,state.config.fans.map(f=>[f.curve_id,f.name]),editable()]);if(signature===librarySignature)return;librarySignature=signature;
