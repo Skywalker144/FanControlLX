@@ -1,0 +1,14 @@
+{
+  "measured_date": "2026-10-20",
+  "timezone": "Asia/Shanghai",
+  "baseline_commit": "a2878927a29119e4e400e29562cd1d8362ff0558",
+  "rust_version": "0.6.0",
+  "rust_binary_sha256": "26d6ca17b627f89541e1517ac47da4452181a7c3f744dffc856ec7d6c253db55",
+  "rust_binary_bytes": 1191840,
+  "kernel": "7.0.0-38-generic",
+  "architecture": "x86_64",
+  "cpu": "Intel Core Ultra 7 265K",
+  "logical_cpus": 20,
+  "gpu": "NVIDIA RTX 5080",
+  "board": "MAG B860M MORTAR WIFI / NCT6687D"
+}
