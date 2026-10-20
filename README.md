@@ -1,6 +1,26 @@
 # FanControlLX
 
-Linux 本机风扇控制服务与 WebUI。后台独立采样和调速，关闭网页或断开 SSH 不影响运行。Python 3.10+、原生 HTML/CSS/JavaScript，无需 npm、pip、桌面环境或外部 CDN。
+Linux 本机风扇控制服务与 WebUI。0.6 使用 Rust 后台及原生 HTML/CSS/JavaScript，网页资源嵌入可执行文件。后台独立采样和调速，关闭网页或断开 SSH 不影响运行，无需 npm、pip、桌面环境或外部 CDN。运行控制服务无需 Python；安装器和回归测试仍使用系统 Python。
+
+## 0.6：Rust 后台与资源优化
+
+- 设备目录、名称与能力每 30 秒重新发现，实时温度、测速与保护仍按约一秒周期处理；读数丢失立即保护，下一周期重新发现。
+- 缓存 NVML 设备句柄和调速范围，移除每轮重复能力查询。NVIDIA 仍由独立进程持有逐路 10 秒租约，并检查显卡自身温度。
+- 主板输出变化时立即写入，稳定时每 3 秒重新写入；芯片看门狗独立每 3 秒续期，保留 15 秒超时保护。
+- 网页隐藏时停止轮询，恢复可见时立即刷新；只更新当前标签页，配置按版本获取、历史增量传输。原 `/api/state` 完整响应仍可用。
+- 配置格式、设备 ID、曲线、控制开关及 NVIDIA 恢复记录兼容 0.5.1。旧 Python 后台保留用于回归对照，默认入口及 systemd 已改为 Rust。
+
+首次从 Python 服务升级：
+
+```bash
+git pull --ff-only
+./build.sh
+sudo ./install-service.sh   # 沿用其他系统驱动的机器加 --skip-driver
+```
+
+构建需要 Rust 1.82+ 和 C 链接器；安装 Rust 可参考 [官方安装说明](https://www.rust-lang.org/tools/install)。构建完成后运行不需要 Rust 工具链。首次迁移必须更新服务单元，之后代码或网页更新需重新构建再重启。架构和迁移说明见 [Rust 后台](docs/RUST.md)。
+
+本机升级前后的 CPU、内存和控制周期实测，以及原始数据和复现方法，见 [性能对比](docs/PERFORMANCE.md)。
 
 ## 更新与配置兼容
 
@@ -14,6 +34,7 @@ Linux 本机风扇控制服务与 WebUI。后台独立采样和调速，关闭�
 
 ```bash
 git pull
+./build.sh
 sudo systemctl restart fancontrollx
 ```
 
@@ -58,6 +79,7 @@ sudo systemctl restart fancontrollx
 ```bash
 git clone https://github.com/Skywalker144/FanControlLX.git
 cd FanControlLX
+./build.sh
 ./webui.sh --diagnose
 ./webui.sh
 ```
@@ -122,7 +144,7 @@ Ubuntu 安装正常工作的 NVIDIA 驱动后，显卡风扇会自动出现在�
 sudo ./install-service.sh
 ```
 
-若已经安装 0.5 的恢复钩子，更新到 0.5.1 只需 `sudo systemctl restart fancontrollx`，再刷新网页；已有曲线和逐路开关保留。
+从 0.5.x 升级到 0.6 时先运行 `./build.sh`，再运行安装器，将主服务和恢复钩子切换为 Rust；已有曲线和逐路开关保留。
 
 另一台机器若沿用已有系统驱动，可使用 `sudo ./install-service.sh --skip-driver`，不安装或加载本机的 NCT6687 模块。详细安装、验证与恢复说明见 [NVIDIA 接入说明](docs/NVIDIA.md)。
 
@@ -135,6 +157,8 @@ sudo ./install-service.sh
 ./webui.sh --diagnose
 ./webui.sh --data-dir /path/to/data
 python3 -m unittest discover -s tests -v
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
 node --check static/app.js
 bash -n webui.sh
 ```
@@ -145,7 +169,7 @@ bash -n webui.sh
 
 ```bash
 # 用独立临时配置启动后台行为的演示服务
-python3 -m fancontrollx.daemon --demo --port 18091 --data-dir /tmp/fancontrollx-browser-test
+./target/release/fancontrollx --service --demo --port 18091 --data-dir /tmp/fancontrollx-browser-test
 # 另一终端执行；测试会重置该演示实例的模拟配置
 CHROME_BIN=/path/to/chrome node tests/browser-smoke.mjs http://127.0.0.1:18091
 ```
