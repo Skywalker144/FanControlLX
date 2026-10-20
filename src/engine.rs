@@ -231,6 +231,23 @@ pub struct Engine {
     events: VecDeque<Value>,
     revision: String,
     disarmed: Vec<Value>,
+    discovery: Discovery,
+}
+/// A short editor lease expires even if the tab crashes or disappears.
+#[derive(Default)]
+pub(crate) struct Discovery {
+    pub(crate) editor_until: f64,
+    pub(crate) last: f64,
+}
+impl Discovery {
+    pub(crate) fn due(&mut self, now: f64, recovery: bool) -> bool {
+        if now - self.last >= 30. && (now < self.editor_until || recovery) {
+            self.last = now;
+            true
+        } else {
+            false
+        }
+    }
 }
 impl Engine {
     pub fn new(
@@ -266,6 +283,7 @@ impl Engine {
             events: VecDeque::new(),
             revision: String::new(),
             disarmed: vec![],
+            discovery: Discovery::default(),
         };
         e.tick()?;
         e.scan(false)?;
@@ -328,7 +346,21 @@ impl Engine {
         }
     }
     pub fn tick(&mut self) -> Result<()> {
-        let sample = self.hardware.sample(false)?;
+        // Reconnect configured devices even with every browser closed. Healthy
+        // background operation never enumerates topology on a periodic timer.
+        let recovery = array(&self.config["fans"]).iter().any(|f| {
+            !text(&f["channel_id"]).is_empty()
+                && (!self
+                    .snapshot
+                    .channels
+                    .iter()
+                    .any(|c| c["id"] == f["channel_id"])
+                    || ((yes(&f["autostart"]) || self.enabled.contains(text(&f["id"])))
+                        && source_values(&f["sensor_ids"], &self.snapshot.sensors).is_none()))
+        });
+        let now = self.now();
+        let force = self.discovery.due(now, recovery);
+        let sample = self.hardware.sample(force)?;
         self.tick_with(sample, self.now())
     }
     pub fn tick_with(&mut self, s: Snapshot, now: f64) -> Result<()> {
@@ -462,6 +494,23 @@ impl Engine {
         }
         v
     }
+    pub fn view_state(&self) -> Value {
+        // Only expose cached readings and the resolved curve for display; omit
+        // full configuration, tokens, discovery metadata, logs and history.
+        json!({"time":wall(),"sample_time":self.history.back().map(|h|&h["time"]),
+            "runtime":"rust","demo":self.demo,"background_service":self.managed,"error":self.error,
+            "cpu":Self::group(&self.snapshot.sensors,"cpu"),"gpu":Self::group(&self.snapshot.sensors,"gpu"),
+            "fans":array(&self.config["fans"]).iter().map(|f|{
+                let curve = array(&self.config["curves"]).iter().find(|c| c["id"] == f["curve_id"]);
+                json!({
+                    "id":f["id"],"name":f["name"],"mode":f["mode"],
+                    "points":curve.map(|c|&c["points"]).unwrap_or(&f["points"]),
+                    "curve_name":curve.map(|c|&c["name"]),
+                    "output":self.outputs[text(&f["id"])],
+                    "pending":self.pending.get(text(&f["id"])).map(|p|&p.0)
+                })
+            }).collect::<Vec<_>>()})
+    }
     pub fn discovery(&self) -> Vec<Value> {
         self.snapshot.channels.iter().map(|c|{
             let f=array(&self.config["fans"]).iter().find(|f|f["channel_id"]==c["id"]);
@@ -490,6 +539,7 @@ impl Engine {
     }
     pub fn scan(&mut self, persist: bool) -> Result<usize> {
         self.snapshot = self.hardware.sample(true)?;
+        self.discovery.last = self.now();
         self.tick()?;
         let mut config = self.config.clone();
         let mut placeholders = vec![
@@ -822,6 +872,10 @@ impl Engine {
             return Err(invalid("请求必须为 JSON 对象"));
         }
         match path {
+            "/api/editor-heartbeat" => {
+                self.discovery.editor_until = self.now() + 15.;
+                return Ok(json!({"ok":true}));
+            }
             "/api/config" => self.update(v, v.get("expected_revision"))?,
             "/api/fan" => {
                 let changes = v["changes"]
