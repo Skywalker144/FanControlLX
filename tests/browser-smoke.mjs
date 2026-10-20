@@ -21,7 +21,7 @@ try{
   });
   socket=new WebSocket(endpoint);
   await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});
-  let next=0,session;const pending=new Map(),errors=[];
+  let next=0,session;const pending=new Map(),errors=[],requests=[];
   const send=(method,params={},sessionId=session)=>new Promise((resolve,reject)=>{
     const id=++next;const timer=setTimeout(()=>{pending.delete(id);reject(new Error(`${method} timed out`));},12000);
     pending.set(id,{resolve,reject,timer});socket.send(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})}));
@@ -30,13 +30,14 @@ try{
     const value=JSON.parse(event.data);
     if(value.id){const p=pending.get(value.id);if(p){clearTimeout(p.timer);pending.delete(value.id);value.error?p.reject(new Error(JSON.stringify(value.error))):p.resolve(value.result);}}
     if(value.method==='Runtime.exceptionThrown')errors.push(value.params.exceptionDetails.text+': '+(value.params.exceptionDetails.exception?.description||''));
+    if(value.method==='Network.requestWillBeSent')requests.push(value.params.request);
     if(value.method==='Page.javascriptDialogOpening')send('Page.handleJavaScriptDialog',{accept:true}).catch(()=>{});
   });
   const target=await send('Target.createTarget',{url:'about:blank'},null);
   session=(await send('Target.attachToTarget',{targetId:target.targetId,flatten:true},null)).sessionId;
-  await send('Page.enable');await send('Runtime.enable');
+  await send('Page.enable');await send('Runtime.enable');await send('Network.enable');
   await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
-  await send('Page.navigate',{url});
+  await send('Page.navigate',{url:new URL('/',url).href});
   const evaluate=async expression=>{
     const result=await send('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});
     if(result.exceptionDetails)throw new Error(result.exceptionDetails.exception?.description||result.exceptionDetails.text);
@@ -64,6 +65,39 @@ try{
     await Promise.all([send('Page.reload'),loaded]);
   };
   await waitFor('document.getElementById("connection-text")?.textContent.includes("已连接")');
+  assert.equal(await evaluate('!!document.querySelector("#edit-link")'),true,'Default page is the viewer');
+  assert.equal(await evaluate('document.querySelectorAll("input,select,dialog").length'),0,'Viewer contains no editor controls');
+  assert.equal(await evaluate(`document.querySelectorAll('.fan-curve-preview>svg').length===document.querySelectorAll('[data-fan]').length && document.querySelectorAll('[data-fan]').length>0`),true,'Every viewer fan has a curve');
+  assert.equal(await evaluate(`document.querySelectorAll('[data-fan] button,[data-fan] a,[data-fan] [tabindex],[data-fan] [draggable]').length`),0,'Viewer fan cards have no editing or drag controls');
+  assert.equal(await evaluate(`(async()=>{const view=await(await fetch('/api/view')).json();return view.fans.every(f=>{const svg=Array.from(document.querySelectorAll('[data-fan]')).find(c=>c.dataset.fan===f.id).querySelector('.fan-curve-preview>svg');return svg.querySelectorAll(':scope>circle').length===f.points.length&&svg.querySelector('[data-curve-current]').getAttribute('visibility')===(Number.isFinite(f.output?.temperature)?'visible':'hidden')})})()`),true,'Viewer curves show configured nodes and available temperature markers');
+  await mkdir('test-results',{recursive:true});
+  for(const width of [1440,320]){
+    await send('Emulation.setDeviceMetricsOverride',{width,height:1100,deviceScaleFactor:1,mobile:false});
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'),true,`Viewer overflow at ${width}px`);
+    const shot=await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});
+    await writeFile(`test-results/viewer-${width}.png`,Buffer.from(shot.data,'base64'));
+  }
+  await evaluate(`(async()=>{window.originalViewerFetch=window.fetch;window.mockViewerState=await(await fetch('/api/view')).json();window.fetch=(...args)=>String(args[0])==='/api/view'?Promise.resolve(new Response(JSON.stringify(window.mockViewerState))):window.originalViewerFetch(...args);const f=window.mockViewerState.fans[0];f.mode='manual';f.points=[[20,10],[60,80]];f.output={...f.output,temperature:40};document.getElementById('retry').click()})()`);
+  await waitFor(`document.querySelector('.fan-curve-preview').textContent.includes('手动模式，曲线未使用')`);
+  assert.equal(await evaluate(`document.querySelector('.fan-curve-preview>svg').getAttribute('aria-label').includes('曲线参考输出 45%')`),true,'Manual mode labels the curve as a reference');
+  await evaluate(`window.mockViewerState.fans[0].output.temperature=null;document.getElementById('retry').click()`);
+  await waitFor(`document.querySelector('[data-curve-current]').getAttribute('visibility')==='hidden'`);
+  await evaluate(`window.fetch=()=>Promise.reject(new Error('simulated disconnect'));document.getElementById('retry').click()`);
+  await waitFor(`!document.getElementById('connection-error').hidden`);
+  assert.equal(await evaluate(`Array.from(document.querySelectorAll('[data-curve-current]')).every(m=>m.getAttribute('visibility')==='hidden')`),true,'Disconnected viewer hides all current markers');
+  assert.equal(await evaluate(`document.querySelectorAll('.fan-curve-preview>svg').length===window.mockViewerState.fans.length`),true,'Disconnected viewer keeps configured curves');
+  await evaluate(`window.fetch=window.originalViewerFetch;document.getElementById('retry').click()`);
+  await waitFor(`document.getElementById('connection-error').hidden`);
+  await evaluate(`(()=>{window.viewerFetch=window.fetch;window.viewerPolls=0;window.fetch=(...args)=>{if(String(args[0]).startsWith('/api/view'))window.viewerPolls++;return window.viewerFetch(...args);};Object.defineProperty(document,'hidden',{configurable:true,value:true});document.dispatchEvent(new Event('visibilitychange'));})()`);
+  await new Promise(resolve=>setTimeout(resolve,1800));
+  assert.equal(await evaluate('window.viewerPolls'),0,'Hidden viewer stops polling');
+  await evaluate(`delete document.hidden;document.dispatchEvent(new Event('visibilitychange'))`);
+  await waitFor('window.viewerPolls>0');
+  assert.equal(requests.some(r=>r.method==='POST'),false,'Viewer sends no mutations or discovery heartbeats');
+  assert.equal(requests.some(r=>new URL(r.url).pathname==='/app.js'),false,'Viewer does not load editor code');
+  await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+  await send('Page.navigate',{url:new URL('/edit',url).href});
+  await waitFor('document.getElementById("connection-text")?.textContent.includes("已连接") && document.querySelector("#curve-dialog")');
   assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'),true,'Desktop overflow');
   if(!snapshotOnly){
     assert.equal(await evaluate('(async()=>{const s=await(await fetch("/api/state")).json();return s.demo&&s.workspace_api===2})()'),true,'Mutations require the new demo backend');
