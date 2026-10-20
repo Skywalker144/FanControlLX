@@ -21,6 +21,29 @@ ROOT = Path(__file__).resolve().parents[1]
 BINARY = ROOT / "target/release/fancontrollx"
 KEY = "nvidia/GPU-abcd/fan0"
 
+@unittest.skipUnless(BINARY.exists(), "Build Rust release binary first")
+class RustInstallTests(unittest.TestCase):
+    def test_dry_run_preserves_config_and_unit_passes_systemd_parser(self):
+        with tempfile.TemporaryDirectory(prefix="fancontrollx-install-") as directory:
+            root = Path(directory) / "project with spaces"
+            (root / "data").mkdir(parents=True)
+            (root / "target/release").mkdir(parents=True)
+            (root / "target/release/fancontrollx").symlink_to(BINARY)
+            config = root / "data/config.json"
+            original = b'{"version":1,"fans":[]}  \n'
+            config.write_bytes(original)
+            result = subprocess.run([str(BINARY), "--install-service", "--project-dir", str(root),
+                                     "--dry-run", "--skip-driver"], check=True, capture_output=True, text=True)
+            self.assertEqual(config.read_bytes(), original)
+            self.assertEqual(list((root / "data").iterdir()), [config])
+            unit = result.stdout.split("[Unit]", 1)[1].split("\n仅预览", 1)[0]
+            path = Path(directory) / "fancontrollx-test.service"
+            path.write_text("[Unit]" + unit)
+            self.assertNotIn("python", unit.lower())
+            self.assertIn("--recover", unit)
+            if shutil.which("systemd-analyze"):
+                subprocess.run(["systemd-analyze", "verify", str(path)], check=True, capture_output=True)
+
 
 @unittest.skipUnless(BINARY.exists(), "Build Rust release binary first")
 class RustHTTPTests(unittest.TestCase):
@@ -89,7 +112,7 @@ class RustHTTPTests(unittest.TestCase):
 
     def test_assets_security_and_input_validation(self):
         self.assertEqual(self.state["runtime"], "rust")
-        for asset in ("/", "/app.js", "/style.css", "/favicon.svg", "/api/health"):
+        for asset in ("/", "/view", "/edit", "/view.js", "/view.css", "/app.js", "/curve.js", "/style.css", "/favicon.svg", "/api/health"):
             self.assertEqual(self.request(asset)[0], 200)
         self.assertEqual(self.request("/../../data/config.json")[0], 404)
         self.assertEqual(self.request("/api/state", headers={"Host": "evil.example"})[0], 403)
@@ -97,6 +120,29 @@ class RustHTTPTests(unittest.TestCase):
         self.assertEqual(self.request("/api/scan", {}, {"X-FanControl-Token": "invalid"})[0], 403)
         self.post("/api/config", {"version": True, "fans": []}, 400)
         self.post("/api/config", {"version": 2, "fans": [{"id": "x", "name": "X", "step_up": True}]}, 400)
+
+    def test_viewer_is_read_only_and_heartbeat_requires_token(self):
+        before = self.get()
+        code, body = self.request("/api/view")
+        self.assertEqual(code, 200)
+        view = json.loads(body)
+        for field in ("config", "csrf_token", "discovery", "history", "events"):
+            self.assertNotIn(field, view)
+        self.assertLess(len(body), len(json.dumps(before)))
+        self.assertEqual([f["id"] for f in view["fans"]], [f["id"] for f in before["config"]["fans"]])
+        self.assertEqual(self.request("/api/editor-heartbeat", {}, {"X-FanControl-Token": ""})[0], 403)
+        self.post("/api/editor-heartbeat", {})
+        self.assertEqual(self.get()["config"], before["config"])
+        self.assertNotIn(b"/app.js", self.request("/")[1])
+        self.assertNotIn(b"dialog", self.request("/")[1])
+        self.assertIn(b"/app.js", self.request("/edit")[1])
+
+    def test_all_edit_endpoints_reject_missing_tokens(self):
+        for path in ("/api/fan", "/api/fan-order", "/api/curve", "/api/curve/delete",
+                     "/api/identify", "/api/identity", "/api/config", "/api/activate",
+                     "/api/release-all", "/api/scan"):
+            with self.subTest(path=path):
+                self.assertEqual(self.request(path, {}, {"X-FanControl-Token": ""})[0], 403)
 
     def test_delta_and_concurrent_configuration(self):
         state = self.get()
@@ -267,6 +313,17 @@ class RustGPUProcessTests(unittest.TestCase):
         time.sleep(11.5)
         self.assertEqual(self.state(), (0, 0))
         self.assertIn("error", self.request("write", duty=60, token=lease["token"]))
+
+    def test_driver_bounds_and_invalid_values_preserve_lease(self):
+        self.start()
+        lease = self.request("acquire", duty=10)["result"]
+        self.assertEqual(self.state(), (1, 30))
+        for duty in (True, -1, 101, float("nan")):
+            self.assertIn("error", self.request("write", duty=duty, token=lease["token"]))
+            self.assertEqual(self.state(), (1, 30))
+        self.assertEqual(len(self.journal()["leases"]), 1)
+        self.request("restore", token=lease["token"])
+        self.assertEqual(self.state(), (0, 0))
 
     def test_failed_restore_retains_journal_and_retries(self):
         self.start()
