@@ -8,16 +8,15 @@ FanControlLX 的应用代码可以复用；风扇驱动、通道绑定和签名�
 
 ```bash
 sudo apt update
-sudo apt install git python3 build-essential
+sudo apt install git build-essential
 git clone https://github.com/Skywalker144/FanControlLX.git
 cd FanControlLX
-python3 --version
 # 安装 Rust 1.82+：https://www.rust-lang.org/tools/install
 ./build.sh
 ./webui.sh --diagnose
 ```
 
-构建需要 Rust 1.82+；安装器需要 Python 3.10+，常驻后台无需 Python。不需要 Conda、pip、npm 或桌面环境。诊断命令只读取硬件信息。保留完整结果，尤其是 `board`、`kernel`、`chips`、`channels` 和 `gpu_error`，据此选择驱动。普通用户下出现不可写权限提示，不代表驱动不工作。
+构建需要 Rust 1.82+；安装器和常驻后台均无需 Python。只有运行回归测试或性能测量时才需要 Python 3。不需要 Conda、pip、npm 或桌面环境。诊断命令只读取硬件信息。保留完整结果，尤其是 `board`、`kernel`、`chips`、`channels` 和 `gpu_error`，据此选择驱动。普通用户下出现不可写权限提示，不代表驱动不工作。
 
 ```bash
 ./webui.sh
