@@ -13,8 +13,8 @@ WorkingDirectory=@WORKING_DIR@
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 @DRIVER_PRE@
-ExecStart=/usr/bin/python3 -m fancontrollx.daemon --data-dir @DATA_DIR@
-ExecStopPost=/usr/bin/python3 -m fancontrollx.nvidia --recover --data-dir @DATA_DIR@
+ExecStart=@BINARY@ --service --data-dir @DATA_DIR@
+ExecStopPost=@BINARY@ --recover --data-dir @DATA_DIR@
 Restart=on-failure
 # Let the driver's 15-second watchdog restore firmware state before a crash restart.
 RestartSec=20

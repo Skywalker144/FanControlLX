@@ -41,7 +41,8 @@ def render_unit(project, data_dir, load_nct6687=True):
         raise ValueError("安装路径不能包含换行符")
     return template.replace("@DRIVER_PRE@", "ExecStartPre=/usr/sbin/modprobe nct6687 msi_fan_brute_force=1" if load_nct6687 else "").replace("@PROJECT_DIR@", quote_unit_path(project)).replace(
         "@WORKING_DIR@", working_dir.replace("%", "%%")).replace(
-        "@DATA_DIR@", quote_unit_path(data_dir, command=True))
+        "@DATA_DIR@", quote_unit_path(data_dir, command=True)).replace(
+        "@BINARY@", quote_unit_path(project / "target/release/fancontrollx", command=True))
 
 
 def prepare_config(raw, enable_confirmed=False):
@@ -79,6 +80,10 @@ def main():
     config_path = ROOT / "data/config.json"
     module = ROOT / ".runtime/nct6687d/nct6687.signed.ko"
     try:
+        binary = ROOT / "target/release/fancontrollx"
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            raise ValueError("请先运行 ./build.sh 构建 Rust 后台，再安装服务")
+        command([str(binary), "--version"])
         if not config_path.is_file():
             raise ValueError("请先在网页中识别设备并保存配置")
         raw = json.loads(config_path.read_text())
