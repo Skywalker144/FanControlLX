@@ -82,6 +82,7 @@ pub struct Real {
     root: PathBuf,
     data: Option<PathBuf>,
     at: Option<Instant>,
+    invalidated: bool,
     sensors: Vec<Reading>,
     fans: Vec<Reading>,
     channels: HashMap<String, Channel>,
@@ -89,6 +90,7 @@ pub struct Real {
     nvml: Option<Nvml>,
     gpu_entries: Vec<GpuEntry>,
     gpu_at: Option<Instant>,
+    gpu_invalidated: bool,
     gpu_retry: Instant,
     gpu_error: Option<String>,
     control_error: Option<String>,
@@ -109,6 +111,7 @@ impl Real {
             root,
             data,
             at: None,
+            invalidated: false,
             sensors: vec![],
             fans: vec![],
             channels: HashMap::new(),
@@ -116,6 +119,7 @@ impl Real {
             nvml: None,
             gpu_entries: vec![],
             gpu_at: None,
+            gpu_invalidated: false,
             gpu_retry: Instant::now(),
             gpu_error: None,
             control_error: None,
@@ -214,6 +218,7 @@ impl Real {
             }
         }
         self.at = Some(Instant::now());
+        self.invalidated = false;
     }
     fn gpu(&mut self, s: &mut Snapshot, force: bool) {
         if self.nvml.is_none() && Instant::now() >= self.gpu_retry {
@@ -234,9 +239,11 @@ impl Real {
         };
         let sample = (|| -> Result<()> {
             if force
-                || self
-                    .gpu_at
-                    .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
+                || self.gpu_at.is_none()
+                || (self.gpu_invalidated
+                    && self
+                        .gpu_at
+                        .is_some_and(|at| at.elapsed() >= Duration::from_secs(30)))
             {
                 let devices = n.devices()?;
                 let mut metadata = vec![];
@@ -272,6 +279,7 @@ impl Real {
                 }
                 self.gpu_entries = metadata;
                 self.gpu_at = Some(Instant::now());
+                self.gpu_invalidated = false;
             }
             let mut temp_error = false;
             let mut errors = vec![];
@@ -314,6 +322,7 @@ impl Real {
             } else if !self.gpu_entries.is_empty() {
                 self.control_error = None;
             }
+            self.gpu_invalidated |= temp_error || !errors.is_empty();
             Ok(())
         })();
         if let Err(e) = sample {
@@ -413,9 +422,11 @@ impl Real {
 impl Hardware for Real {
     fn sample(&mut self, force: bool) -> Result<Snapshot> {
         if force
-            || self
-                .at
-                .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
+            || self.at.is_none()
+            || (self.invalidated
+                && self
+                    .at
+                    .is_some_and(|at| at.elapsed() >= Duration::from_secs(30)))
         {
             self.discover();
         }
@@ -459,7 +470,7 @@ impl Hardware for Real {
             s.channels.push(m);
         }
         if stale {
-            self.at = None;
+            self.invalidated = true;
         }
         self.gpu(&mut s, force);
         Ok(s)
@@ -568,6 +579,7 @@ impl Hardware for Real {
         (self.gpu_error.clone(), self.control_error.clone())
     }
 }
+
 pub struct Demo {
     pub duties: HashMap<String, f64>,
     pub fixed: Option<Snapshot>,
@@ -627,5 +639,66 @@ impl Hardware for Demo {
     }
     fn disarm(&mut self, _: &[Value]) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::tests::Temp;
+    #[test]
+    fn healthy_background_keeps_metadata_until_manual_scan() {
+        let t = Temp::new();
+        let chip = t.0.join("hwmon0");
+        fs::create_dir(&chip).unwrap();
+        fs::write(chip.join("name"), "nct6687").unwrap();
+        fs::write(chip.join("temp1_input"), "50000").unwrap();
+        fs::write(chip.join("temp1_label"), "old name").unwrap();
+        let mut h = Real::with_root(t.0.clone(), None);
+        h.sample(true).unwrap();
+        h.at = Some(Instant::now() - Duration::from_secs(600));
+        fs::write(chip.join("temp1_label"), "new name").unwrap();
+        fs::write(chip.join("temp1_input"), "60000").unwrap();
+        let s = h.sample(false).unwrap();
+        assert_eq!(s.sensors[0]["name"], "old name");
+        assert_eq!(num(&s.sensors[0]["value"]), 60.);
+        let s = h.sample(true).unwrap();
+        assert_eq!(s.sensors[0]["name"], "new name");
+    }
+    #[test]
+    fn invalid_readings_are_not_cached_and_discovery_retries_are_bounded() {
+        let t = Temp::new();
+        let chip = t.0.join("hwmon0");
+        fs::create_dir(&chip).unwrap();
+        fs::write(chip.join("name"), "nct6687").unwrap();
+        fs::write(chip.join("temp1_input"), "50000").unwrap();
+        let mut h = Real::with_root(t.0.clone(), None);
+        h.sample(true).unwrap();
+        fs::remove_file(chip.join("temp1_input")).unwrap();
+        assert!(h.sample(false).unwrap().sensors[0]["value"].is_null());
+        assert!(h.invalidated);
+        fs::write(chip.join("temp1_label"), "reloaded").unwrap();
+        fs::write(chip.join("temp1_input"), "61000").unwrap();
+        let s = h.sample(false).unwrap();
+        assert_ne!(s.sensors[0]["name"], "reloaded");
+        h.at = Some(Instant::now() - Duration::from_secs(31));
+        let s = h.sample(false).unwrap();
+        assert_eq!(s.sensors[0]["name"], "reloaded");
+        assert!(!h.invalidated);
+    }
+    #[test]
+    fn unknown_hwmon_driver_remains_read_only() {
+        let t = Temp::new();
+        let chip = t.0.join("hwmon0");
+        fs::create_dir(&chip).unwrap();
+        for (name, value) in [("name", "unknown"), ("pwm1", "100"), ("pwm1_enable", "2")] {
+            fs::write(chip.join(name), value).unwrap();
+        }
+        let mut h = Real::with_root(t.0.clone(), None);
+        let s = h.sample(true).unwrap();
+        let c = s.channels.iter().find(|c| c["chip"] == "unknown").unwrap();
+        assert!(!yes(&c["writable"]));
+        assert!(h.acquire(text(&c["id"]), 50.).is_err());
+        assert_eq!(fs::read_to_string(chip.join("pwm1")).unwrap(), "100");
     }
 }
