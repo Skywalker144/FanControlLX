@@ -2,6 +2,7 @@ mod common;
 mod config;
 mod engine;
 mod hardware;
+mod install;
 mod lock;
 mod nvml;
 mod server;
@@ -32,6 +33,9 @@ fn cpu_time() -> f64 {
     t.tv_sec as f64 + t.tv_nsec as f64 / 1e9
 }
 fn run() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--install-service") {
+        return install::run(std::env::args().skip(2));
+    }
     let mut host = "127.0.0.1".to_owned();
     let mut port = 8090u16;
     let mut data = std::env::current_dir()?.join("data");
