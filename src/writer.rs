@@ -37,7 +37,7 @@ impl Gpu for Nvml {
 pub struct Writer<G: Gpu> {
     pub gpu: G,
     pub leases: HashMap<String, Value>,
-    deadlines: HashMap<String, Instant>,
+    pub(crate) deadlines: HashMap<String, Instant>,
     journal: PathBuf,
 }
 impl<G: Gpu> Writer<G> {
