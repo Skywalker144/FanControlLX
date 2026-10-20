@@ -18,9 +18,8 @@ fi
 if [[ "${1:-}" == "--foreground" ]]; then
   shift
 fi
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "需要 Python 3.10 或更新版本。" >&2
+if [[ ! -x target/release/fancontrollx ]]; then
+  echo "请先执行 ./build.sh 构建 Rust 后台。" >&2
   exit 1
 fi
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else "需要 Python 3.10 或更新版本")'
-exec python3 -m fancontrollx.server "$@"
+exec ./target/release/fancontrollx "$@"
