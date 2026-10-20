@@ -9,8 +9,12 @@ use std::{
 };
 const INDEX: &[u8] = include_bytes!("../static/index.html");
 const JS: &[u8] = include_bytes!("../static/app.js");
+const CURVE_JS: &[u8] = include_bytes!("../static/curve.js");
 const CSS: &[u8] = include_bytes!("../static/style.css");
 const ICON: &[u8] = include_bytes!("../static/favicon.svg");
+const VIEW: &[u8] = include_bytes!("../static/view.html");
+const VIEW_JS: &[u8] = include_bytes!("../static/view.js");
+const VIEW_CSS: &[u8] = include_bytes!("../static/view.css");
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 fn allowed_host(host: &str) -> bool {
     if host.bytes().any(|b| b.is_ascii_whitespace())
@@ -106,7 +110,11 @@ fn handle(
     let (path, query) = parts[1].split_once('?').unwrap_or((parts[1], ""));
     if parts[0] == "GET" {
         let asset = match path {
-            "/" => Some((INDEX, "text/html; charset=utf-8")),
+            "/" | "/view" => Some((VIEW, "text/html; charset=utf-8")),
+            "/edit" => Some((INDEX, "text/html; charset=utf-8")),
+            "/view.js" => Some((VIEW_JS, "text/javascript; charset=utf-8")),
+            "/view.css" => Some((VIEW_CSS, "text/css; charset=utf-8")),
+            "/curve.js" => Some((CURVE_JS, "text/javascript; charset=utf-8")),
             "/app.js" => Some((JS, "text/javascript; charset=utf-8")),
             "/style.css" => Some((CSS, "text/css; charset=utf-8")),
             "/favicon.svg" => Some((ICON, "image/svg+xml")),
@@ -118,6 +126,12 @@ fn handle(
         }
         let engine = engine.lock().map_err(|_| conflict("控制器异常"))?;
         let value = match path {
+            "/api/view" => {
+                let mut value = engine.view_state();
+                value["version"] = json!(VERSION);
+                value["hostname"] = json!(hostname);
+                value
+            }
             "/api/health" => {
                 json!({"ok":engine.error.is_none(),"version":VERSION,"background_service":engine.managed,"runtime":"rust"})
             }
