@@ -4,9 +4,10 @@
 
 ## 已有后台服务
 
-首次升级到 0.5 后执行：
+首次从 Python 后台升级到 0.6 后执行：
 
 ```bash
+./build.sh
 sudo ./install-service.sh
 ```
 
@@ -45,7 +46,7 @@ sudo ./install-service.sh --skip-driver
 
 例如，设置 `[25°C, 0%]`、`[45°C, 0%]`、`[55°C, 50%]`、`[85°C, 100%]`，在曲线计算温度不超过 45°C 时交回自动模式，高于此温度后恢复手动曲线控制。仅把最左侧单个节点设为 0%，其他节点为正值时，中间插值通常仍大于 0%；需要让希望交回自动的温度区间保持 0%。
 
-已经安装 0.5 服务单元的机器，更新代码后执行 `sudo systemctl restart fancontrollx`，刷新网页即可使用新逻辑。配置格式不变，无需重新确认设备或修改最低输出为 0。
+首次升级到 0.6 需构建并运行安装器更新服务单元；之后更新代码执行 `./build.sh` 和 `sudo systemctl restart fancontrollx`，再刷新网页。配置格式不变，无需重新确认设备或修改最低输出为 0。
 
 ## 独立守护和恢复
 
@@ -67,7 +68,7 @@ sudo journalctl -u fancontrollx -n 50 --no-pager
 
 ```bash
 sudo systemctl stop fancontrollx
-sudo /usr/bin/python3 -m fancontrollx.nvidia --recover --data-dir ./data
+sudo ./target/release/fancontrollx --recover --data-dir ./data
 ```
 
 ## 验证
