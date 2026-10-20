@@ -8,14 +8,16 @@ FanControlLX 的应用代码可以复用；风扇驱动、通道绑定和签名�
 
 ```bash
 sudo apt update
-sudo apt install git python3
+sudo apt install git python3 build-essential
 git clone https://github.com/Skywalker144/FanControlLX.git
 cd FanControlLX
 python3 --version
+# 安装 Rust 1.82+：https://www.rust-lang.org/tools/install
+./build.sh
 ./webui.sh --diagnose
 ```
 
-需要 Python 3.10 或更新版本，不需要 Conda、pip、npm 或桌面环境。诊断命令只读取硬件信息。保留完整结果，尤其是 `board`、`kernel`、`chips`、`channels` 和 `gpu_error`，据此选择驱动。普通用户下出现不可写权限提示，不代表驱动不工作。
+构建需要 Rust 1.82+；安装器需要 Python 3.10+，常驻后台无需 Python。不需要 Conda、pip、npm 或桌面环境。诊断命令只读取硬件信息。保留完整结果，尤其是 `board`、`kernel`、`chips`、`channels` 和 `gpu_error`，据此选择驱动。普通用户下出现不可写权限提示，不代表驱动不工作。
 
 ```bash
 ./webui.sh
@@ -71,10 +73,11 @@ systemctl is-enabled fancontrollx
 
 ```bash
 git pull --ff-only
+./build.sh
 sudo systemctl restart fancontrollx
 systemctl status fancontrollx --no-pager
 ```
 
 配置保存在被 Git 忽略的 `data/` 中，`git pull` 不会覆盖它。0.4 兼容旧版配置，首次保存前会生成 `config.before-v2.json`，原有绑定、名称、曲线、温度源和控制开关保留，无需重新识别设备。更新后刷新网页。修改服务模板或重新构建驱动后，需要再运行安装器；普通代码更新重启服务即可。内核升级后必须重新编译、签名、安装第三方模块，当前没有 DKMS 自动重建。
 
-首次升级到 0.5，需要运行安装器更新 NVIDIA 恢复钩子；沿用系统驱动的机器保留 `--skip-driver` 选项。
+首次从 Python 后台升级到 0.6，构建后需要运行安装器，将主服务与 NVIDIA 恢复钩子切换为 Rust；沿用系统驱动的机器保留 `--skip-driver` 选项。之后每次代码或网页更新也必须重新构建后再重启。
