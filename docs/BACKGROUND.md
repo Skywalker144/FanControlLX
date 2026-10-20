@@ -25,7 +25,7 @@ NVIDIA 或已配置好系统驱动的机器可加 `--skip-driver`，跳过 NCT66
 
 可以先执行 `./install-service.sh --dry-run --enable-confirmed` 查看完整服务配置与计划自动控制的设备，不需要 sudo，也不修改系统。
 
-服务使用编译后的 Rust 可执行文件，不依赖 Python 或 Conda；只有安装器使用系统 `/usr/bin/python3`。配置仍使用项目的 `data/config.json`，无需手动复制。服务在每次启动前通过 modprobe 加载驱动并设置 `msi_fan_brute_force=1`，无需另写 modules-load 配置。
+服务与安装器使用编译后的 Rust 可执行文件，不依赖 Python 或 Conda。配置仍使用项目的 `data/config.json`，无需手动复制。服务在每次启动前通过 modprobe 加载驱动并设置 `msi_fan_brute_force=1`，无需另写 modules-load 配置。
 
 ## 日常使用
 
