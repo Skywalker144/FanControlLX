@@ -37,9 +37,16 @@ async function api(path,body){const r=await fetch(path,{method:'POST',headers:{'
 async function refresh(){
   const sequence=++readSequence;
   try{
-    const r=await fetch('/api/state',{cache:'no-store',signal:AbortSignal.timeout(6000)});if(!r.ok)throw new Error(`HTTP ${r.status}`);
+    const query=state?.runtime==='rust'?`?since=${encodeURIComponent(state.config_revision)}&after=${state.history.at(-1)?.time||0}`:'';
+    const r=await fetch(`/api/state${query}`,{cache:'no-store',signal:AbortSignal.timeout(6000)});if(!r.ok)throw new Error(`HTTP ${r.status}`);
     const next=await r.json();if(sequence<appliedSequence)return;
-    appliedSequence=sequence;state=next;connected=true;render();
+    if(!next.config)next.config=state.config;
+    if(next.history_delta&&next.csrf_token===state?.csrf_token){
+      const history=new Map(state.history.map(row=>[row.time,row]));
+      for(const row of next.history)history.set(row.time,row);
+      next.history=[...history.values()].sort((a,b)=>a.time-b.time).slice(-180);
+    }
+    appliedSequence=sequence;state=next;connected=true;if(!document.hidden)render();
   }catch(error){if(sequence<appliedSequence)return;appliedSequence=sequence;connected=false;if(state)render();else{$('connection-error').hidden=false;$('connection-text').textContent='连接失败';$('service-value').textContent='未连接';}}
 }
 function sourceTemperature(f){
@@ -52,7 +59,7 @@ function sourceTemperature(f){
   return f.aggregation==='average'?values.reduce((a,b)=>a+b,0)/values.length:f.aggregation==='min'?Math.min(...values):Math.max(...values);
 }
 function interpolate(points,t){if(t<=points[0][0])return points[0][1];for(let i=1;i<points.length;i++){const [a,b]=[points[i-1],points[i]];if(t<=b[0])return a[1]+(b[1]-a[1])*(t-a[0])/(b[0]-a[0]);}return points.at(-1)[1];}
-function tab(name){currentTab=name;for(const key of ['control','devices','sensors','diagnostics'])$(`tab-${key}`).hidden=key!==name;document.querySelectorAll('nav [data-tab]').forEach(el=>{el.classList.toggle('active',el.dataset.tab===name);el.setAttribute('aria-current',el.dataset.tab===name?'page':'false');});$('page-title').textContent={control:'风扇控制',devices:'设备设置',sensors:'硬件传感器',diagnostics:'诊断与日志'}[name];}
+function tab(name){currentTab=name;for(const key of ['control','devices','sensors','diagnostics'])$(`tab-${key}`).hidden=key!==name;document.querySelectorAll('nav [data-tab]').forEach(el=>{el.classList.toggle('active',el.dataset.tab===name);el.setAttribute('aria-current',el.dataset.tab===name?'page':'false');});$('page-title').textContent={control:'风扇控制',devices:'设备设置',sensors:'硬件传感器',diagnostics:'诊断与日志'}[name];if(state)render();}
 function spark(id,kind){const values=state.history.slice(-80);let path='',drawing=false;values.forEach((v,i)=>{if(v[kind]==null){drawing=false;return;}path+=`${drawing?'L':'M'}${i/Math.max(1,values.length-1)*200},${42-Math.max(0,Math.min(100,v[kind]))/100*42} `;drawing=true;});$(id).innerHTML=`<path d="${path}" fill="none" stroke="currentColor" stroke-width="1.7"/>`;}
 function render(){
   $('connection-error').hidden=connected;$('connection-dot').classList.toggle('offline',!connected);$('connection-text').textContent=connected?(state.demo?'已连接 · 演示设备':'本机服务已连接'):'连接已断开';$('machine-name').textContent=state.hostname;$('version').textContent=`v${state.version}`;
@@ -71,7 +78,11 @@ function render(){
   else if(state.demo)banner='演示模式：这里的操作仅作用于模拟设备，配置与真实设备分开保存。';
   else if(!state.channels.length)banner='尚未发现风扇控制通道。可先编辑离线配置，再到设备设置中绑定硬件。';
   $('hardware-banner').classList.toggle('info',!!state.demo&&!state.error&&state.workspace_api===2);$('hardware-banner').hidden=!banner;$('hardware-banner').textContent=banner;
-  renderFanCards();renderLibrary();renderDiscovery();renderSensors();renderDiagnostics();updateIdentification();
+  if(currentTab==='control'){renderFanCards();renderLibrary();}
+  else if(currentTab==='devices')renderDiscovery();
+  else if(currentTab==='sensors')renderSensors();
+  else if(currentTab==='diagnostics')renderDiagnostics();
+  updateIdentification();
   if(curveEdit&&curveEdit.dragging===null)drawChart();
 }
 function sourceOptions(f){const choices=[...sources,...state.sensors.filter(s=>s.kind==='gpu').map(s=>[s.id,s.name])];const value=f.sensor_ids.length===1&&choices.some(s=>s[0]===f.sensor_ids[0])?f.sensor_ids[0]:'@custom';return choices.map(([id,name])=>`<option value="${esc(id)}" ${id===value?'selected':''}>${esc(name)}</option>`).join('')+`<option value="@custom" ${value==='@custom'?'selected':''}>自定义组合…</option>`;}
@@ -332,4 +343,17 @@ $('retry').addEventListener('click',refresh);$('export-config').addEventListener
 $('import-file').addEventListener('change',async()=>{const file=$('import-file').files[0];if(!file)return;try{if(file.size>256*1024)throw new Error('配置文件超过 256 KB');const config=JSON.parse(await file.text());if(!confirm('导入会替换此机器的全部配置，并按其中的控制开关应用。继续？'))return;await api('/api/config',{...config,expected_revision:state.config_revision});await refresh();toast('配置已导入；旧版格式已兼容读取');}catch(error){toast(error.message,true);}finally{$('import-file').value='';}});
 window.addEventListener('beforeunload',event=>{if(curveEdit?.dirty||deviceEdit?.dirty){event.preventDefault();event.returnValue='';}});
 document.addEventListener('keydown',event=>{if((event.ctrlKey||event.metaKey)&&event.key==='s'){event.preventDefault();if($('curve-dialog').open)$('curve-form').requestSubmit();else if($('device-dialog').open)$('device-form').requestSubmit();}});
-async function poll(){await refresh();setTimeout(poll,1500);}poll();
+let pollTimer, pollGeneration=0;
+async function poll(generation){
+  if(document.hidden||generation!==pollGeneration)return;
+  await refresh();
+  if(!document.hidden&&generation===pollGeneration)pollTimer=setTimeout(()=>poll(generation),1500);
+}
+function resumePolling(){
+  clearTimeout(pollTimer);const generation=++pollGeneration;
+  if(!document.hidden)poll(generation);
+}
+document.addEventListener('visibilitychange',resumePolling);
+window.addEventListener('pagehide',()=>{clearTimeout(pollTimer);++pollGeneration;});
+window.addEventListener('pageshow',resumePolling);
+resumePolling();
