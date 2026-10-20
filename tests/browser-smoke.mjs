@@ -44,6 +44,9 @@ try{
   };
   const waitFor=async expression=>{const deadline=Date.now()+10000;while(Date.now()<deadline){if(await evaluate(expression))return;await new Promise(resolve=>setTimeout(resolve,120));}throw new Error(`Wait timed out: ${expression}`);};
   const editorFits=async label=>{
+    // A faster backend can finish a save before the dialog's opening animation.
+    // Measure layout after that animation, not at an arbitrary in-between frame.
+    await evaluate(`(async()=>{await Promise.all(document.getElementById('curve-dialog').getAnimations({subtree:true}).map(a=>a.finished.catch(()=>{})));await new Promise(requestAnimationFrame)})()`);
     const layout=await evaluate(`(()=>{const d=document.getElementById('curve-dialog'),b=d.getBoundingClientRect();return{fits:d.scrollHeight<=d.clientHeight+1&&d.scrollWidth<=d.clientWidth+1&&b.top>=0&&b.bottom<=innerHeight,height:d.clientHeight,scrollHeight:d.scrollHeight,parts:Array.from(d.querySelector('form').children).map(el=>[el.className,el.getBoundingClientRect().height])}})()`);
     assert.equal(layout.fits,true,`Curve editor must fit without scrolling: ${label}: ${JSON.stringify(layout)}`);
   };
@@ -141,7 +144,9 @@ try{
     await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
     await evaluate(`document.getElementById('point-list').scrollTop=0`);
     await evaluate(`document.getElementById('curve-chart').scrollIntoView({block:'center'})`);
+    await evaluate(`new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))`);
     const box=await evaluate(`(()=>{const b=document.querySelector('#curve-chart [data-node="2"]').getBoundingClientRect();return{x:b.x+b.width/2,y:b.y+b.height/2}})()`);
+    await send('Input.dispatchMouseEvent',{type:'mouseMoved',x:box.x,y:box.y});
     await send('Input.dispatchMouseEvent',{type:'mousePressed',x:box.x,y:box.y,button:'left',clickCount:1});
     await send('Input.dispatchMouseEvent',{type:'mouseMoved',x:box.x+18,y:box.y-12,buttons:1});
     await send('Input.dispatchMouseEvent',{type:'mouseReleased',x:box.x+18,y:box.y-12,button:'left',clickCount:1});
@@ -239,6 +244,18 @@ try{
     await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
     await post('/api/curve/delete',{id:many.id});
     for(const name of ['sensors','diagnostics','devices','control'])await evaluate(`document.querySelector('[data-tab="${name}"]').click()`);
+    await evaluate(`(()=>{
+      window.__originalFetch=window.fetch;window.__stateReads=0;
+      window.fetch=(...args)=>{if(String(args[0]).startsWith('/api/state'))window.__stateReads++;return window.__originalFetch(...args)};
+      Object.defineProperty(document,'hidden',{configurable:true,value:true});
+      Object.defineProperty(document,'visibilityState',{configurable:true,value:'hidden'});
+      document.dispatchEvent(new Event('visibilitychange'));
+    })()`);
+    await new Promise(resolve=>setTimeout(resolve,1800));
+    assert.equal(await evaluate('window.__stateReads'),0,'Hidden page stops state polling');
+    await evaluate(`delete document.hidden;delete document.visibilityState;document.dispatchEvent(new Event('visibilitychange'))`);
+    await waitFor('window.__stateReads>0');
+    await evaluate('window.fetch=window.__originalFetch;delete window.__originalFetch;delete window.__stateReads');
   }
   await mkdir('test-results',{recursive:true});
   // Theme preference survives reload; every navigation destination fits narrow screens.
@@ -299,9 +316,10 @@ try{
       window.nvidiaFixture=snapshot;
       document.querySelector('nav [data-tab="devices"]').click();
     })()`);
-    await waitFor(`document.querySelector('[data-fan="browser-nvidia"]')!==null`);
+    await waitFor(`document.querySelector('#discovered-fans [data-channel^="nvidia/"]')!==null`);
     assert.equal(await evaluate(`document.querySelector('#discovered-fans [data-channel^="nvidia/"]')!==null`),true,'Zero RPM GPU must be visible among online devices');
     await evaluate(`document.querySelector('nav [data-tab="control"]').click()`);
+    await waitFor(`document.querySelector('[data-fan="browser-nvidia"]')!==null`);
     const gpuCard=`document.querySelector('[data-fan="browser-nvidia"]')`;
     assert.equal(await evaluate(`${gpuCard}.querySelector('[data-manual]').min`),'30','GPU slider respects driver minimum');
     assert.equal(await evaluate(`${gpuCard}.querySelector('[data-live="manual"]').textContent`),'30%','Manual output label agrees with clamped slider');
