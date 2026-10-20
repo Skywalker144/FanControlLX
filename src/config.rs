@@ -164,7 +164,7 @@ pub fn save(path: &Path, value: &Value) -> Result<()> {
     bytes.push(b'\n');
     atomic(path, &bytes)
 }
-fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap();
     let temp = parent.join(format!(".config-{}", token()?));
     let result = (|| {
