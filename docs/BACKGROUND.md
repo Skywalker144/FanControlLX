@@ -1,6 +1,6 @@
 # 后台控制与开机自启
 
-浏览器是配置客户端。`fancontrollx.daemon` 持有传感器采样、曲线计算、PWM 控制、硬件租约及本地 HTTP 配置接口；systemd 管理它的生命周期。没有网页客户端连接时，控制循环仍每秒运行。
+浏览器是配置客户端。Rust 可执行文件 `target/release/fancontrollx --service` 持有传感器采样、曲线计算、PWM 控制、硬件租约及本地 HTTP 配置接口；systemd 管理它的生命周期。没有网页客户端连接时，控制循环仍约每秒运行。
 
 ## 安装
 
@@ -8,6 +8,7 @@
 
 ```bash
 cd /home/sky/RL/FanControlLX
+./build.sh
 sudo ./install-service.sh --enable-confirmed
 ```
 
@@ -24,7 +25,7 @@ NVIDIA 或已配置好系统驱动的机器可加 `--skip-driver`，跳过 NCT66
 
 可以先执行 `./install-service.sh --dry-run --enable-confirmed` 查看完整服务配置与计划自动控制的设备，不需要 sudo，也不修改系统。
 
-服务使用系统的 `/usr/bin/python3`，不依赖 Conda。配置仍使用项目的 `data/config.json`，无需手动复制。服务在每次启动前通过 modprobe 加载驱动并设置 `msi_fan_brute_force=1`，无需另写 modules-load 配置。
+服务使用编译后的 Rust 可执行文件，不依赖 Python 或 Conda；只有安装器使用系统 `/usr/bin/python3`。配置仍使用项目的 `data/config.json`，无需手动复制。服务在每次启动前通过 modprobe 加载驱动并设置 `msi_fan_brute_force=1`，无需另写 modules-load 配置。
 
 ## 日常使用
 
@@ -55,17 +56,17 @@ sudo systemctl start fancontrollx
 sudo systemctl disable --now fancontrollx
 ```
 
-只更新应用代码时重启服务即可。修改服务配置或重新安装驱动时，再运行 `sudo ./install-service.sh`；不带 `--enable-confirmed` 会保留当前逐路启用/停用偏好。
+更新代码或网页资源后先运行 `./build.sh` 再重启服务。修改服务配置或重新安装驱动时，再运行 `sudo ./install-service.sh`；不带 `--enable-confirmed` 会保留当前逐路启用/停用偏好。
 
 ## 恢复行为与限制
 
 - 新发现的风扇默认不自动控制。只有已确认、已绑定且持久设置启用的通道才会恢复。
 - 设备暂时离线或不能写入时保留待接管状态，每 10 秒重试，网页显示原因。
 - 正常停止尝试恢复原来的硬件控制模式。异常退出后 systemd 等待 20 秒再重启，让当前驱动的 15 秒硬件看门狗有机会恢复固件状态；尚未完成恢复的租约不会被覆盖。
-- NVIDIA 使用独立写入进程和逐通道 10 秒租约，失联、超时或 SIGTERM 时恢复原模式。原状态在首次调速前写入 `data/nvidia-leases.json`；新服务的 `ExecStopPost` 在进程组被强杀后再尝试恢复，接管前也会恢复残留租约。0.5 首次升级请运行安装器更新服务单元；后续只更新应用代码仍可仅重启。驱动失联时恢复可能失败，日志和恢复记录会保留。
+- NVIDIA 使用同一 Rust 可执行文件的独立写入进程和逐通道 10 秒租约，失联、超时或 SIGTERM 时恢复原模式。原状态在首次调速前写入 `data/nvidia-leases.json`；`ExecStopPost` 在进程组被强杀后再尝试恢复，接管前也会恢复残留租约。首次升级到 0.6 请运行安装器更新服务单元；后续代码更新需重新构建并重启。驱动失联时恢复可能失败，日志和恢复记录会保留。
 - 模块安装仅覆盖构建时的内核。本版没有 DKMS 自动重建。内核更新后需要重新构建并用同一受信任密钥签名，然后重新运行安装脚本。模块加载失败时，服务启动失败并记录日志，保留硬件自身控制。
 - 本次对服务策略的自动化测试使用模拟硬件；真实开机、异常断电、内核故障等系统级行为仍需在本机验证。
 
 ## 更新应用
 
-执行 `git pull` 后运行 `sudo systemctl restart fancontrollx`，再刷新网页。每台机器的 `data/` 都不纳入 Git，更新保留本机配置。0.4 兼容 v1 配置，首次保存前生成 `data/config.before-v2.json`，后续保存不覆盖备份。只更新应用无需重装驱动。
+执行 `git pull`、`./build.sh` 后运行 `sudo systemctl restart fancontrollx`，再刷新网页。首次从 Python 后台升级还需运行安装器更新服务单元。每台机器的 `data/` 都不纳入 Git，更新保留本机配置。0.6 继续兼容 v1 配置，首次保存前生成 `data/config.before-v2.json`，后续保存不覆盖备份。只更新应用无需重装驱动。
