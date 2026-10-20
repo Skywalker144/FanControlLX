@@ -10,7 +10,6 @@ Type=exec
 User=root
 Group=root
 WorkingDirectory=@WORKING_DIR@
-Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 @DRIVER_PRE@
 ExecStart=@BINARY@ --service --data-dir @DATA_DIR@
