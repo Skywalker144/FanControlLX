@@ -1,17 +1,19 @@
+import {attribute, text} from './ui.js';
+
 // Shared read-only curve rendering for the viewer and editor.
 const fmt = (value, digits=0) => value == null ? "—" : Number(value).toFixed(digits).replace(/\.0$/, "");
 function interpolate(points,t){if(t<=points[0][0])return points[0][1];for(let i=1;i<points.length;i++){const [a,b]=[points[i-1],points[i]];if(t<=b[0])return a[1]+(b[1]-a[1])*(t-a[0])/(b[0]-a[0]);}return points.at(-1)[1];}
 function updateMiniCurve(svg,points,temperature,mode){
   const marker=svg.querySelector('[data-curve-current]'),available=Number.isFinite(temperature);
-  marker.setAttribute('visibility',available?'visible':'hidden');
-  if(!available){svg.setAttribute('aria-label','曲线预览：当前温度不可用');return;}
+  attribute(marker,'visibility',available?'visible':'hidden');
+  if(!available){attribute(svg,'aria-label','曲线预览：当前温度不可用');return;}
   const low=Math.min(20,points[0][0]),high=Math.max(100,points.at(-1)[0]);
   const duty=interpolate(points,temperature),x=12+(Math.max(low,Math.min(high,temperature))-low)/(high-low)*236;
-  marker.setAttribute('transform',`translate(${x} 0)`);
-  marker.querySelector('circle').setAttribute('cy',64-duty*.52);
+  attribute(marker,'transform',`translate(${x} 0)`);
+  attribute(marker.querySelector('circle'),'cy',64-duty*.52);
   const reading=`当前温度 ${fmt(temperature,1)}°C · ${mode==='manual'?'曲线参考输出':'曲线目标输出'} ${fmt(duty,1)}%${mode==='manual'?'（手动模式，曲线未使用）':''}`;
-  marker.querySelector('title').textContent=reading;
-  svg.setAttribute('aria-label',`曲线预览：${reading}`);
+  text(marker.querySelector('title'),reading);
+  attribute(svg,'aria-label',`曲线预览：${reading}`);
 }
 function miniCurve(points,live=false){
   const low=Math.min(20,points[0][0]),high=Math.max(100,points.at(-1)[0]);
