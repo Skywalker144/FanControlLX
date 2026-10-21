@@ -35,7 +35,13 @@ fn read(path: &Path) -> String {
         .to_owned()
 }
 fn number_at(path: &Path) -> Option<f64> {
-    read(path).parse::<f64>().ok().filter(|n| n.is_finite())
+    // Parse the read buffer directly; numeric sampling needs no trimmed copy.
+    fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite())
 }
 fn named(path: &Path, default: &str) -> String {
     let n = read(path);
@@ -86,6 +92,7 @@ pub struct Real {
     sensors: Vec<Reading>,
     fans: Vec<Reading>,
     channels: HashMap<String, Channel>,
+    channel_order: Vec<String>,
     chips: Vec<Value>,
     nvml: Option<Nvml>,
     gpu_entries: Vec<GpuEntry>,
@@ -115,6 +122,7 @@ impl Real {
             sensors: vec![],
             fans: vec![],
             channels: HashMap::new(),
+            channel_order: vec![],
             chips: vec![],
             nvml: None,
             gpu_entries: vec![],
@@ -217,6 +225,8 @@ impl Real {
                 }
             }
         }
+        self.channel_order = self.channels.keys().cloned().collect();
+        self.channel_order.sort();
         self.at = Some(Instant::now());
         self.invalidated = false;
     }
@@ -301,7 +311,9 @@ impl Real {
                     if policy.is_err() || duty.is_err() {
                         c["writable"] = json!(false);
                         c["reason"] = json!("NVIDIA 读数不可用");
-                        self.gpu_at = None;
+                        // Keep the discovery timestamp so a read failure cannot
+                        // turn the 30-second retry into enumeration every tick.
+                        self.gpu_invalidated = true;
                     }
                     c["mode"] = json!(policy.ok());
                     c["duty"] = json!(duty.ok());
@@ -451,9 +463,7 @@ impl Hardware for Real {
             m["rpm"] = json!(v);
             s.fans.push(m);
         }
-        let mut keys: Vec<_> = self.channels.keys().collect();
-        keys.sort();
-        for key in keys {
+        for key in &self.channel_order {
             let c = &self.channels[key];
             let mut m = c.meta.clone();
             let duty = number_at(&c.pwm);
