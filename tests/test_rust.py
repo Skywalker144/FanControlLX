@@ -112,7 +112,7 @@ class RustHTTPTests(unittest.TestCase):
 
     def test_assets_security_and_input_validation(self):
         self.assertEqual(self.state["runtime"], "rust")
-        for asset in ("/", "/view", "/edit", "/view.js", "/view.css", "/app.js", "/curve.js", "/style.css", "/favicon.svg", "/api/health"):
+        for asset in ("/", "/view", "/edit", "/view.js", "/view.css", "/app.js", "/curve.js", "/curve-editor.js", "/ui.js", "/confirm.js", "/icons.svg", "/style.css", "/favicon.svg", "/api/health"):
             self.assertEqual(self.request(asset)[0], 200)
         self.assertEqual(self.request("/../../data/config.json")[0], 404)
         self.assertEqual(self.request("/api/state", headers={"Host": "evil.example"})[0], 403)
@@ -120,6 +120,29 @@ class RustHTTPTests(unittest.TestCase):
         self.assertEqual(self.request("/api/scan", {}, {"X-FanControl-Token": "invalid"})[0], 403)
         self.post("/api/config", {"version": True, "fans": []}, 400)
         self.post("/api/config", {"version": 2, "fans": [{"id": "x", "name": "X", "step_up": True}]}, 400)
+
+    def test_static_revalidation_and_dynamic_state_cache_invalidation(self):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}/icons.svg")
+        with self.opener.open(request) as response:
+            etag = response.headers["ETag"]
+            self.assertEqual(response.headers["Cache-Control"], "no-cache")
+            self.assertIn(b"Lucide", response.read())
+        for tag in (etag, "W/" + etag, '"different", ' + etag, "*"):
+            req = urllib.request.Request(request.full_url, headers={"If-None-Match": tag})
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                self.opener.open(req)
+            self.assertEqual(caught.exception.code, 304)
+            self.assertEqual(caught.exception.read(), b"")
+            self.assertNotIn("Content-Length", caught.exception.headers)
+        self.assertEqual(self.request("/icons.svg", headers={"If-None-Match": '"old-binary"'})[0], 200)
+        before = self.get()
+        view_before = json.loads(self.request("/api/view")[1])
+        fan = before["config"]["fans"][0]
+        self.post("/api/fan", {"id": fan["id"], "changes": {"name": "Cache invalidated"}})
+        self.assertEqual(self.get()["config"]["fans"][0]["name"], "Cache invalidated")
+        self.assertNotEqual(json.loads(self.request("/api/view")[1])["fans"][0]["name"], view_before["fans"][0]["name"])
+        with self.opener.open(f"http://127.0.0.1:{self.port}/api/health") as response:
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
 
     def test_viewer_is_read_only_and_heartbeat_requires_token(self):
         before = self.get()
@@ -260,6 +283,82 @@ class RustGPUProcessTests(unittest.TestCase):
 
     def journal(self):
         return json.loads((self.data / "nvidia-leases.json").read_text())
+
+    def test_monitor_read_failure_does_not_enumerate_every_cycle(self):
+        # Monitor mode cannot acquire controls. Only NVML is replaced; hwmon
+        # access is read-only, exactly like --diagnose / --benchmark.
+        (self.data / "fail-read").touch()
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        self.process = subprocess.Popen(
+            [str(BINARY), "--port", str(port), "--data-dir", str(self.data)],
+            env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        def state():
+            with opener.open(f"http://127.0.0.1:{port}/api/state", timeout=5) as response:
+                return json.load(response)
+
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                snapshot = state()
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    self.fail("Monitor did not start")
+                time.sleep(.05)
+        gpu = next(c for c in snapshot["channels"] if c.get("backend") == "nvidia")
+        self.assertFalse(gpu["writable"])
+        scans = (self.data / "enumerations").read_text()
+        sampled = snapshot["history"][-1]["time"]
+        time.sleep(3.2)
+        self.assertGreater(state()["history"][-1]["time"], sampled)
+        self.assertEqual((self.data / "enumerations").read_text(), scans)
+        self.assertFalse((self.data / "writes").exists())
+        (self.data / "fail-read").unlink()
+        body = b"{}"
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/scan", data=body,
+                                     headers={"Content-Type": "application/json", "X-FanControl-Token": snapshot["csrf_token"]})
+        with opener.open(req) as response:
+            self.assertEqual(response.status, 200)
+        self.assertGreater(len((self.data / "enumerations").read_text()), len(scans))
+        self.assertEqual(next(c for c in state()["channels"] if c.get("backend") == "nvidia")["mode"], 0)
+        self.assertFalse((self.data / "writes").exists())
+
+    def test_monitor_does_not_reuse_cached_readings_during_stalled_sample(self):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        self.process = subprocess.Popen(
+            [str(BINARY), "--port", str(port), "--data-dir", str(self.data)],
+            env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        url = f"http://127.0.0.1:{port}/api/view"
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                with opener.open(url, timeout=5) as response:
+                    before = json.load(response)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    self.fail("Monitor did not start")
+                time.sleep(.05)
+        (self.data / "stall-read").touch()
+        deadline = time.monotonic() + 5
+        while not (self.data / "read-started").exists():
+            if time.monotonic() >= deadline:
+                self.fail("Driver read did not start")
+            time.sleep(.02)
+        with self.assertRaises((TimeoutError, urllib.error.URLError)):
+            opener.open(url, timeout=.2)
+        self.assertIsNone(self.process.poll())
+        (self.data / "stall-read").unlink()
+        with opener.open(url, timeout=8) as response:
+            self.assertGreater(json.load(response)["sample_time"], before["sample_time"])
+        self.assertFalse((self.data / "writes").exists())
 
     def test_parent_eof_restores_original_manual_target(self):
         self.start(1, 42)
