@@ -285,7 +285,6 @@ impl Engine {
             disarmed: vec![],
             discovery: Discovery::default(),
         };
-        e.tick()?;
         e.scan(false)?;
         e.queue();
         Ok(e)
@@ -404,15 +403,18 @@ impl Engine {
             }
         }
         let mut outputs = json!({});
-        for f in array(&self.config["fans"]).to_vec() {
-            let id = text(&f["id"]);
-            let active = self.enabled.contains(id);
-            let m = self.memory.entry(id.into()).or_insert_with(|| Memory {
+        // Indexing gives each fan a short borrow. Only failure metadata is
+        // copied before recovery; the full configuration is never cloned here.
+        for index in 0..array(&self.config["fans"]).len() {
+            let f = &self.config["fans"][index];
+            let id = text(&f["id"]).to_owned();
+            let active = self.enabled.contains(&id);
+            let m = self.memory.entry(id.clone()).or_insert_with(|| Memory {
                 last: now,
                 changed: now,
                 ..Memory::default()
             });
-            let mut o = compute(&f, &self.config["curves"], &s, m, active, now);
+            let mut o = compute(f, &self.config["curves"], &s, m, active, now);
             if active {
                 let key = text(&f["channel_id"]);
                 let result = if s
@@ -444,14 +446,16 @@ impl Engine {
                         });
                     }
                     Err(e) => {
-                        let _ = self.release(id, true);
-                        if self.managed && yes(&f["autostart"]) {
-                            self.pending.insert(id.into(), (e.1.clone(), now + 10.));
+                        let autostart = yes(&f["autostart"]);
+                        let name = text(&f["name"]).to_owned();
+                        let _ = self.release(&id, true);
+                        if self.managed && autostart {
+                            self.pending.insert(id.clone(), (e.1.clone(), now + 10.));
                         }
                         o["status"] = json!("控制失败");
                         o["fault"] = json!(e.1);
                         o["active"] = json!(false);
-                        self.event(format!("{}：{e}", text(&f["name"])));
+                        self.event(format!("{name}：{e}"));
                     }
                 }
             }
@@ -538,9 +542,10 @@ impl Engine {
         f
     }
     pub fn scan(&mut self, persist: bool) -> Result<usize> {
-        self.snapshot = self.hardware.sample(true)?;
+        let snapshot = self.hardware.sample(true)?;
         self.discovery.last = self.now();
-        self.tick()?;
+        // Apply protection to the newly discovered readings before any disk I/O.
+        self.tick_with(snapshot, self.now())?;
         let mut config = self.config.clone();
         let mut placeholders = vec![
             config::default_fan("cpu-fan", "CPU 散热风扇", "@cpu"),
@@ -566,7 +571,9 @@ impl Engine {
             }
         }
         self.commit(config::validate(&config)?, persist)?;
-        self.tick()?;
+        // Reconcile newly added configurations using the same fresh scan; do
+        // not read the hardware three times for one discovery operation.
+        self.tick_with(self.snapshot.clone(), self.now())?;
         if persist {
             self.event(format!("扫描完成，新增 {added} 个在线设备；未启用新的控制"));
         }
