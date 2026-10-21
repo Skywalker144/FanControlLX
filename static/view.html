@@ -8,7 +8,7 @@
 </head>
 <body class="viewer">
   <main class="view-main">
-    <header class="view-header"><div><a class="view-brand" href="/">FanControlLX</a><h1>风扇运行状态</h1><p id="service-caption">正在连接本机后台</p></div><div class="toolbar"><button id="theme-toggle" class="button secondary" aria-label="切换主题">切换主题</button><a href="/edit" class="button secondary" id="edit-link">编辑风扇</a></div></header>
+    <header class="view-header"><div><a class="view-brand" href="/">FanControlLX</a><h1>风扇运行状态</h1><p id="service-caption">正在连接本机后台</p></div><div class="toolbar"><button id="theme-toggle" class="button secondary theme-toggle" aria-label="切换主题"><svg class="ui-icon theme-moon" viewBox="0 0 24 24" aria-hidden="true"><use href="/icons.svg#icon-moon"></use></svg><svg class="ui-icon theme-sun" viewBox="0 0 24 24" aria-hidden="true"><use href="/icons.svg#icon-sun"></use></svg></button><a href="/edit" class="button secondary" id="edit-link">编辑风扇</a></div></header>
     <div id="connection-error" class="banner error" role="status" hidden>连接已中断，读数已过期。<button class="text-button" id="retry">重新连接</button></div>
     <div id="service-error" class="banner error" role="status" hidden></div>
     <section class="metrics" aria-label="实时监控">
