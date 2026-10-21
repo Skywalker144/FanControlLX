@@ -5,4 +5,5 @@ data/
 .venv/
 node_modules/
 test-results/
+/docs/performance/
 target/
