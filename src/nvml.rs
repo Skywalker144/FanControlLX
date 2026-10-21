@@ -9,8 +9,50 @@ use std::{
     time::{Duration, Instant},
 };
 type Handle = *mut c_void;
+type Init = unsafe extern "C" fn() -> i32;
+type Uint = unsafe extern "C" fn(Handle, *mut u32) -> i32;
+type FanUint = unsafe extern "C" fn(Handle, u32, *mut u32) -> i32;
+type StringFn = unsafe extern "C" fn(Handle, *mut c_char, u32) -> i32;
+type SetFan = unsafe extern "C" fn(Handle, u32, u32) -> i32;
+type AutoFan = unsafe extern "C" fn(Handle, u32) -> i32;
+#[repr(C)]
+struct Speed {
+    version: u32,
+    fan: u32,
+    speed: u32,
+}
+
+// Optional entry points stay optional: older drivers may still provide readable
+// temperatures. Resolve once per library lifetime, including missing functions.
+struct Api {
+    shutdown: Option<Init>,
+    error: Option<unsafe extern "C" fn(i32) -> *const c_char>,
+    count: Option<unsafe extern "C" fn(*mut u32) -> i32>,
+    by_index: Option<unsafe extern "C" fn(u32, *mut Handle) -> i32>,
+    by_uuid: Option<unsafe extern "C" fn(*const c_char, *mut Handle) -> i32>,
+    uuid: Option<StringFn>,
+    name: Option<StringFn>,
+    num_fans: Option<Uint>,
+    policy: Option<FanUint>,
+    speed: Option<FanUint>,
+    target: Option<FanUint>,
+    temperature: Option<FanUint>,
+    limits: Option<unsafe extern "C" fn(Handle, *mut u32, *mut u32) -> i32>,
+    rpm: Option<unsafe extern "C" fn(Handle, *mut Speed) -> i32>,
+    set: Option<SetFan>,
+    auto: Option<AutoFan>,
+}
+fn load<T: Copy>(lib: &Library, name: &[u8]) -> Option<T> {
+    // Each caller supplies the exact NVML signature. Nvml owns the Library for
+    // as long as these copied function pointers can be invoked.
+    unsafe { lib.get::<T>(name).ok().map(|f| *f) }
+}
+fn required<T: Copy>(function: Option<T>, name: &str) -> Result<T> {
+    function.ok_or_else(|| conflict(format!("驱动接口不可用: {name}")))
+}
 pub struct Nvml {
-    lib: Library,
+    _lib: Library,
+    api: Api,
     handles: HashMap<String, usize>,
     limits: HashMap<usize, (Instant, (u32, u32))>,
 }
@@ -24,30 +66,43 @@ impl Nvml {
     pub fn new() -> Result<Self> {
         let lib =
             unsafe { Library::new("libnvidia-ml.so.1") }.map_err(|e| conflict(e.to_string()))?;
+        let init = required(load::<Init>(&lib, b"nvmlInit_v2\0"), "nvmlInit_v2")?;
+        let api = Api {
+            shutdown: load(&lib, b"nvmlShutdown\0"),
+            error: load(&lib, b"nvmlErrorString\0"),
+            count: load(&lib, b"nvmlDeviceGetCount_v2\0"),
+            by_index: load(&lib, b"nvmlDeviceGetHandleByIndex_v2\0"),
+            by_uuid: load(&lib, b"nvmlDeviceGetHandleByUUID\0"),
+            uuid: load(&lib, b"nvmlDeviceGetUUID\0"),
+            name: load(&lib, b"nvmlDeviceGetName\0"),
+            num_fans: load(&lib, b"nvmlDeviceGetNumFans\0"),
+            policy: load(&lib, b"nvmlDeviceGetFanControlPolicy_v2\0"),
+            speed: load(&lib, b"nvmlDeviceGetFanSpeed_v2\0"),
+            target: load(&lib, b"nvmlDeviceGetTargetFanSpeed\0"),
+            temperature: load(&lib, b"nvmlDeviceGetTemperature\0"),
+            limits: load(&lib, b"nvmlDeviceGetMinMaxFanSpeed\0"),
+            rpm: load(&lib, b"nvmlDeviceGetFanSpeedRPM\0"),
+            set: load(&lib, b"nvmlDeviceSetFanSpeed_v2\0"),
+            auto: load(&lib, b"nvmlDeviceSetDefaultFanSpeed_v2\0"),
+        };
         let n = Self {
-            lib,
+            _lib: lib,
+            api,
             handles: HashMap::new(),
             limits: HashMap::new(),
         };
-        unsafe {
-            let f = n.sym::<unsafe extern "C" fn() -> i32>(b"nvmlInit_v2\0")?;
-            n.check(f())?;
-        }
+        n.check(unsafe { init() })?;
         Ok(n)
-    }
-    unsafe fn sym<T>(&self, name: &[u8]) -> Result<libloading::Symbol<'_, T>> {
-        self.lib
-            .get(name)
-            .map_err(|e| conflict(format!("驱动接口不可用: {e}")))
     }
     fn check(&self, code: i32) -> Result<()> {
         if code == 0 {
             return Ok(());
         }
         let message = unsafe {
-            self.sym::<unsafe extern "C" fn(i32) -> *const c_char>(b"nvmlErrorString\0")
-                .ok()
-                .map(|f| CStr::from_ptr(f(code)).to_string_lossy().into_owned())
+            self.api.error.and_then(|f| {
+                let pointer = f(code);
+                (!pointer.is_null()).then(|| CStr::from_ptr(pointer).to_string_lossy().into_owned())
+            })
         };
         Err(conflict(
             message.unwrap_or_else(|| format!("NVML 错误 {code}")),
@@ -56,7 +111,10 @@ impl Nvml {
     pub fn uint(&self, name: &[u8], handle: usize) -> Result<u32> {
         let mut v = 0;
         unsafe {
-            let f = self.sym::<unsafe extern "C" fn(Handle, *mut u32) -> i32>(name)?;
+            let f = match name {
+                b"nvmlDeviceGetNumFans\0" => required(self.api.num_fans, "nvmlDeviceGetNumFans")?,
+                _ => return Err(invalid("未知 NVML 数值接口")),
+            };
             self.check(f(handle as Handle, &mut v))?;
         }
         Ok(v)
@@ -64,7 +122,19 @@ impl Nvml {
     pub fn fan_uint(&self, name: &[u8], handle: usize, fan: u32) -> Result<u32> {
         let mut v = 0;
         unsafe {
-            let f = self.sym::<unsafe extern "C" fn(Handle, u32, *mut u32) -> i32>(name)?;
+            let function = match name {
+                b"nvmlDeviceGetFanControlPolicy_v2\0" => self.api.policy,
+                b"nvmlDeviceGetFanSpeed_v2\0" => self.api.speed,
+                b"nvmlDeviceGetTargetFanSpeed\0" => self.api.target,
+                b"nvmlDeviceGetTemperature\0" => self.api.temperature,
+                _ => return Err(invalid("未知 NVML 风扇接口")),
+            };
+            let f = required(
+                function,
+                std::str::from_utf8(name)
+                    .unwrap_or("NVML")
+                    .trim_end_matches('\0'),
+            )?;
             self.check(f(handle as Handle, fan, &mut v))?;
         }
         Ok(v)
@@ -72,7 +142,17 @@ impl Nvml {
     fn string(&self, name: &[u8], handle: usize) -> Result<String> {
         let mut bytes = [0 as c_char; 128];
         unsafe {
-            let f = self.sym::<unsafe extern "C" fn(Handle, *mut c_char, u32) -> i32>(name)?;
+            let function = match name {
+                b"nvmlDeviceGetUUID\0" => self.api.uuid,
+                b"nvmlDeviceGetName\0" => self.api.name,
+                _ => return Err(invalid("未知 NVML 字符串接口")),
+            };
+            let f = required(
+                function,
+                std::str::from_utf8(name)
+                    .unwrap_or("NVML")
+                    .trim_end_matches('\0'),
+            )?;
             self.check(f(handle as Handle, bytes.as_mut_ptr(), 128))?;
             bytes[127] = 0;
             Ok(CStr::from_ptr(bytes.as_ptr())
@@ -83,8 +163,7 @@ impl Nvml {
     pub fn devices(&mut self) -> Result<Vec<Device>> {
         let mut count = 0;
         unsafe {
-            let f =
-                self.sym::<unsafe extern "C" fn(*mut u32) -> i32>(b"nvmlDeviceGetCount_v2\0")?;
+            let f = required(self.api.count, "nvmlDeviceGetCount_v2")?;
             self.check(f(&mut count))?;
         }
         let mut result = vec![];
@@ -93,9 +172,7 @@ impl Nvml {
         for i in 0..count {
             let mut h = std::ptr::null_mut();
             unsafe {
-                let f = self.sym::<unsafe extern "C" fn(u32, *mut Handle) -> i32>(
-                    b"nvmlDeviceGetHandleByIndex_v2\0",
-                )?;
+                let f = required(self.api.by_index, "nvmlDeviceGetHandleByIndex_v2")?;
                 self.check(f(i, &mut h))?;
             }
             let uuid = self.string(b"nvmlDeviceGetUUID\0", h as usize)?;
@@ -116,9 +193,7 @@ impl Nvml {
         let name = CString::new(uuid).map_err(|_| invalid("无效 GPU UUID"))?;
         let mut h = std::ptr::null_mut();
         unsafe {
-            let f = self.sym::<unsafe extern "C" fn(*const c_char, *mut Handle) -> i32>(
-                b"nvmlDeviceGetHandleByUUID\0",
-            )?;
+            let f = required(self.api.by_uuid, "nvmlDeviceGetHandleByUUID")?;
             self.check(f(name.as_ptr(), &mut h))?;
         }
         self.handles.insert(uuid.to_owned(), h as usize);
@@ -132,9 +207,7 @@ impl Nvml {
         }
         let (mut min, mut max) = (0, 0);
         unsafe {
-            let f = self.sym::<unsafe extern "C" fn(Handle, *mut u32, *mut u32) -> i32>(
-                b"nvmlDeviceGetMinMaxFanSpeed\0",
-            )?;
+            let f = required(self.api.limits, "nvmlDeviceGetMinMaxFanSpeed")?;
             self.check(f(h as Handle, &mut min, &mut max))?;
         }
         if min > max || !(20..=100).contains(&max) {
@@ -152,21 +225,13 @@ impl Nvml {
         Ok(v as f64)
     }
     pub fn rpm(&self, h: usize, fan: u32) -> Result<u32> {
-        #[repr(C)]
-        struct Speed {
-            version: u32,
-            fan: u32,
-            speed: u32,
-        }
         let mut s = Speed {
             version: std::mem::size_of::<Speed>() as u32 | (1 << 24),
             fan,
             speed: 0,
         };
         unsafe {
-            let f = self.sym::<unsafe extern "C" fn(Handle, *mut Speed) -> i32>(
-                b"nvmlDeviceGetFanSpeedRPM\0",
-            )?;
+            let f = required(self.api.rpm, "nvmlDeviceGetFanSpeedRPM")?;
             self.check(f(h as Handle, &mut s))?;
         }
         Ok(s.speed)
@@ -178,14 +243,8 @@ impl Nvml {
             return Err(conflict("NVIDIA 风扇索引不存在"));
         }
         self.limits(h)?;
-        unsafe {
-            self.sym::<unsafe extern "C" fn(Handle, u32, u32) -> i32>(
-                b"nvmlDeviceSetFanSpeed_v2\0",
-            )?;
-            self.sym::<unsafe extern "C" fn(Handle, u32) -> i32>(
-                b"nvmlDeviceSetDefaultFanSpeed_v2\0",
-            )?;
-        }
+        required(self.api.set, "nvmlDeviceSetFanSpeed_v2")?;
+        required(self.api.auto, "nvmlDeviceSetDefaultFanSpeed_v2")?;
         let policy = self.fan_uint(b"nvmlDeviceGetFanControlPolicy_v2\0", h, fan)?;
         if policy > 1 {
             return Err(conflict("未知 NVIDIA 控制策略"));
@@ -202,17 +261,13 @@ impl Nvml {
     }
     fn set(&self, h: usize, fan: u32, duty: u32) -> Result<()> {
         unsafe {
-            let f = self.sym::<unsafe extern "C" fn(Handle, u32, u32) -> i32>(
-                b"nvmlDeviceSetFanSpeed_v2\0",
-            )?;
+            let f = required(self.api.set, "nvmlDeviceSetFanSpeed_v2")?;
             self.check(f(h as Handle, fan, duty))
         }
     }
     fn auto(&self, h: usize, fan: u32) -> Result<()> {
         unsafe {
-            let f = self.sym::<unsafe extern "C" fn(Handle, u32) -> i32>(
-                b"nvmlDeviceSetDefaultFanSpeed_v2\0",
-            )?;
+            let f = required(self.api.auto, "nvmlDeviceSetDefaultFanSpeed_v2")?;
             self.check(f(h as Handle, fan))
         }
     }
@@ -261,7 +316,7 @@ impl Nvml {
 impl Drop for Nvml {
     fn drop(&mut self) {
         unsafe {
-            if let Ok(f) = self.sym::<unsafe extern "C" fn() -> i32>(b"nvmlShutdown\0") {
+            if let Some(f) = self.api.shutdown {
                 f();
             }
         }
