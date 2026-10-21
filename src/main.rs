@@ -5,6 +5,7 @@ mod hardware;
 mod install;
 mod lock;
 mod nvml;
+mod runtime;
 mod server;
 #[cfg(test)]
 mod tests;
@@ -17,7 +18,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -191,9 +192,9 @@ fn run() -> Result<()> {
         service,
     )?;
     engine.resume();
-    let engine = Arc::new(Mutex::new(engine));
-    if let Err(e) = server::start(listener, engine.clone()) {
-        let _ = engine.lock().unwrap().shutdown();
+    let (controller, client) = runtime::channel(&engine);
+    if let Err(e) = server::start(listener, client) {
+        let _ = engine.shutdown();
         return Err(e);
     }
     println!(
@@ -209,19 +210,18 @@ fn run() -> Result<()> {
     );
     let mut next = Instant::now() + Duration::from_secs(1);
     while !stop.load(Ordering::Relaxed) {
-        std::thread::sleep(next.saturating_duration_since(Instant::now()));
         if Instant::now() >= next {
-            engine.lock().map_err(|_| conflict("控制器异常"))?.cycle();
+            controller.invalidate();
+            engine.cycle();
+            controller.changed(&engine);
             next = Instant::now() + Duration::from_secs(1);
         }
+        controller.serve_one(&mut engine, next.saturating_duration_since(Instant::now()));
     }
+    controller.invalidate();
     let mut last = None;
     for _ in 0..10 {
-        match engine
-            .lock()
-            .map_err(|_| conflict("控制器异常"))?
-            .shutdown()
-        {
+        match engine.shutdown() {
             Ok(()) => return Ok(()),
             Err(e) => last = Some(e),
         }
