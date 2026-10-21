@@ -44,6 +44,11 @@ try{
     return result.result.value;
   };
   const waitFor=async expression=>{const deadline=Date.now()+10000;while(Date.now()<deadline){if(await evaluate(expression))return;await new Promise(resolve=>setTimeout(resolve,120));}throw new Error(`Wait timed out: ${expression}`);};
+  const confirmAction=async(accept=true)=>{
+    await waitFor('document.getElementById("confirm-dialog").open');
+    await evaluate(`document.querySelector('#confirm-dialog [value="${accept?'accept':'cancel'}"]').click()`);
+    await waitFor('!document.getElementById("confirm-dialog").open');
+  };
   const editorFits=async label=>{
     // A faster backend can finish a save before the dialog's opening animation.
     // Measure layout after that animation, not at an arbitrary in-between frame.
@@ -80,6 +85,9 @@ try{
   await evaluate(`(async()=>{window.originalViewerFetch=window.fetch;window.mockViewerState=await(await fetch('/api/view')).json();window.fetch=(...args)=>String(args[0])==='/api/view'?Promise.resolve(new Response(JSON.stringify(window.mockViewerState))):window.originalViewerFetch(...args);const f=window.mockViewerState.fans[0];f.mode='manual';f.points=[[20,10],[60,80]];f.output={...f.output,temperature:40};document.getElementById('retry').click()})()`);
   await waitFor(`document.querySelector('.fan-curve-preview').textContent.includes('手动模式，曲线未使用')`);
   assert.equal(await evaluate(`document.querySelector('.fan-curve-preview>svg').getAttribute('aria-label').includes('曲线参考输出 45%')`),true,'Manual mode labels the curve as a reference');
+  await evaluate(`window.__viewerCurve=document.querySelector('.fan-curve-preview>svg');window.mockViewerState.fans[0].output.actual=53;document.getElementById('retry').click()`);
+  await waitFor(`document.querySelector('[data-live="actual"]').textContent==='53'`);
+  assert.equal(await evaluate(`window.__viewerCurve===document.querySelector('.fan-curve-preview>svg')`),true,'Telemetry preserves viewer curve nodes');
   await evaluate(`window.mockViewerState.fans[0].output.temperature=null;document.getElementById('retry').click()`);
   await waitFor(`document.querySelector('[data-curve-current]').getAttribute('visibility')==='hidden'`);
   await evaluate(`window.fetch=()=>Promise.reject(new Error('simulated disconnect'));document.getElementById('retry').click()`);
@@ -94,7 +102,7 @@ try{
   await evaluate(`delete document.hidden;document.dispatchEvent(new Event('visibilitychange'))`);
   await waitFor('window.viewerPolls>0');
   assert.equal(requests.some(r=>r.method==='POST'),false,'Viewer sends no mutations or discovery heartbeats');
-  assert.equal(requests.some(r=>new URL(r.url).pathname==='/app.js'),false,'Viewer does not load editor code');
+  assert.equal(requests.some(r=>['/app.js','/curve-editor.js','/confirm.js'].includes(new URL(r.url).pathname)),false,'Viewer does not load editor code');
   await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
   await send('Page.navigate',{url:new URL('/edit',url).href});
   await waitFor('document.getElementById("connection-text")?.textContent.includes("已连接") && document.querySelector("#curve-dialog")');
@@ -172,6 +180,10 @@ try{
     await evaluate(`document.getElementById('preset').value='quiet';document.getElementById('preset').dispatchEvent(new Event('change'))`);
     assert.equal(await evaluate(`document.querySelectorAll('#point-list .point').length`),5,'All nodes are listed together');
     assert.equal(await evaluate(`document.querySelector('.point-pagination')===null`),true,'Node pagination is removed');
+    await evaluate(`window.__plotNode=document.querySelector('#curve-chart [data-node="2"]');window.__plotNode.focus({preventScroll:true})`);
+    await new Promise(resolve=>setTimeout(resolve,1800));
+    assert.equal(await evaluate(`window.__plotNode===document.querySelector('#curve-chart [data-node="2"]')&&document.activeElement===window.__plotNode`),true,'Polling preserves curve nodes and keyboard focus');
+
     await editorFits('five nodes');
     await send('Emulation.setDeviceMetricsOverride',{width:320,height:640,deviceScaleFactor:1,mobile:true});
     await editorFits('five independent nodes with sharing option at 320 × 640');
@@ -186,6 +198,10 @@ try{
     await send('Input.dispatchMouseEvent',{type:'mouseReleased',x:box.x+18,y:box.y-12,button:'left',clickCount:1});
     assert.notEqual(await evaluate(`document.querySelector('[data-point="2"][data-axis="1"]').value`),'42');
     await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
+    await confirmAction(false);
+    assert.equal(await evaluate('document.getElementById("curve-dialog").open'),true,'Cancel preserves the editing dialog and draft');
+    await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
+    await confirmAction();
     await waitFor('!document.getElementById("curve-dialog").open');
     assert.equal(JSON.stringify((await saved()).fans[0].points),initialPoints,'Cancel must leave running curve untouched');
     await evaluate(`${card(first)}.querySelector('[data-edit-curve]').click();document.getElementById('curve-share').checked=true;document.getElementById('curve-share').dispatchEvent(new Event('change'));document.getElementById('curve-name').value='日常曲线';document.getElementById('preset').value='quiet';document.getElementById('preset').dispatchEvent(new Event('change'));document.getElementById('curve-form').requestSubmit()`);
@@ -235,6 +251,7 @@ try{
     await waitFor('!document.getElementById("add-dialog").open');
     const offline=(await saved()).fans.find(f=>f.name==='离线风扇');assert.ok(offline);assert.equal(offline.channel_id,null);
     await evaluate(`document.querySelector('[data-tab="control"]').click();${card(offline.id)}.querySelector('[data-device]').click();document.getElementById('delete-fan').click()`);
+    await confirmAction();
     await waitFor('!document.getElementById("device-dialog").open');assert.equal((await saved()).fans.length,3);
     await evaluate(`document.getElementById('new-curve').click();document.getElementById('curve-name').value='未分配曲线';document.getElementById('curve-form').requestSubmit()`);
     await waitFor('!document.getElementById("curve-dialog").open');
@@ -243,6 +260,7 @@ try{
     await evaluate(`document.querySelector('[data-library-copy="${free.id}"]').click();document.getElementById('curve-form').requestSubmit()`);
     await waitFor('!document.getElementById("curve-dialog").open');assert.equal((await saved()).curves.length,3);
     await evaluate(`document.querySelector('[data-library-delete="${free.id}"]').click()`);
+    await confirmAction();
     await waitFor(`(async()=> (await(await fetch('/api/state')).json()).config.curves.length===2)()`);
     // Another client changes the shared curve while this editor is open.
     await evaluate(`document.querySelector('[data-library-edit="${curve.id}"]').click()`);
@@ -276,6 +294,7 @@ try{
     assert.equal(await evaluate(`document.getElementById('point-list').scrollTop>0&&document.querySelector('[data-point="31"][data-axis="1"]').value==='98'`),true,'Editing preserves the scrolled node position');
     await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
     await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
+    await confirmAction();
     await post('/api/curve/delete',{id:many.id});
     for(const name of ['sensors','diagnostics','devices','control'])await evaluate(`document.querySelector('[data-tab="${name}"]').click()`);
     await evaluate(`(()=>{

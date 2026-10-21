@@ -1,22 +1,11 @@
 import {interpolate, miniCurve, updateMiniCurve} from './curve.js';
+import {icon, text, attribute, html, installTheme} from './ui.js';
+import {createCurvePlot} from './curve-editor.js';
+import {createConfirmation} from './confirm.js';
 
 const $ = id => document.getElementById(id);
-const icon = name => `<svg class="ui-icon" aria-hidden="true"><use href="#icon-${name}"></use></svg>`;
-
-// Theme stays local to this browser; it never changes the hardware configuration.
-function setTheme(theme){
-  document.documentElement.dataset.theme=theme;
-  const dark=theme==='dark',label=dark?'切换为浅色主题':'切换为深色主题';
-  $('theme-toggle').setAttribute('aria-label',label);$('theme-toggle').title=label;
-  $('theme-toggle').setAttribute('aria-pressed',String(dark));
-}
-let savedTheme;
-try{savedTheme=localStorage.getItem('fancontrollx-theme');}catch{}
-setTheme(['light','dark'].includes(savedTheme)?savedTheme:'light');
-$('theme-toggle').addEventListener('click',()=>{
-  const theme=document.documentElement.dataset.theme==='dark'?'light':'dark';
-  setTheme(theme);try{localStorage.setItem('fancontrollx-theme',theme);}catch{}
-});
+installTheme($('theme-toggle'));
+const confirmAction=createConfirmation($('confirm-dialog'));
 
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const clone = value => JSON.parse(JSON.stringify(value));
@@ -69,24 +58,24 @@ function sourceTemperature(f){
   return f.aggregation==='average'?values.reduce((a,b)=>a+b,0)/values.length:f.aggregation==='min'?Math.min(...values):Math.max(...values);
 }
 function tab(name){currentTab=name;for(const key of ['control','devices','sensors','diagnostics'])$(`tab-${key}`).hidden=key!==name;document.querySelectorAll('nav [data-tab]').forEach(el=>{el.classList.toggle('active',el.dataset.tab===name);el.setAttribute('aria-current',el.dataset.tab===name?'page':'false');});$('page-title').textContent={control:'风扇控制',devices:'设备设置',sensors:'硬件传感器',diagnostics:'诊断与日志'}[name];if(state)render();}
-function spark(id,kind){const values=state.history.slice(-80);let path='',drawing=false;values.forEach((v,i)=>{if(v[kind]==null){drawing=false;return;}path+=`${drawing?'L':'M'}${i/Math.max(1,values.length-1)*200},${42-Math.max(0,Math.min(100,v[kind]))/100*42} `;drawing=true;});$(id).innerHTML=`<path d="${path}" fill="none" stroke="currentColor" stroke-width="1.7"/>`;}
+function spark(id,kind){const values=state.history.slice(-80);let path='',drawing=false;values.forEach((v,i)=>{if(v[kind]==null){drawing=false;return;}path+=`${drawing?'L':'M'}${i/Math.max(1,values.length-1)*200},${42-Math.max(0,Math.min(100,v[kind]))/100*42} `;drawing=true;});html($(id),`<path d="${path}" fill="none" stroke="currentColor" stroke-width="1.7"/>`);}
 function render(){
-  $('connection-error').hidden=connected;$('connection-dot').classList.toggle('offline',!connected);$('connection-text').textContent=connected?(state.demo?'已连接 · 演示设备':'本机服务已连接'):'连接已断开';$('machine-name').textContent=state.hostname;$('version').textContent=`v${state.version}`;
+  $('connection-error').hidden=connected;$('connection-dot').classList.toggle('offline',!connected);text($('connection-text'),connected?(state.demo?'已连接 · 演示设备':'本机服务已连接'):'连接已断开');text($('machine-name'),state.hostname);text($('version'),`v${state.version}`);
   for(const kind of ['cpu','gpu']){const group=state.sensors.filter(s=>s.kind===kind&&s.value!=null);$(`${kind}-temp`).textContent=connected&&group.length?fmt(Math.max(...group.map(s=>s.value)),1):'—';spark(`${kind}-spark`,kind);}
   const active=Object.values(state.outputs).filter(o=>o.active).length;
-  $('service-value').textContent=!connected?'状态未知':state.error?'需要检查':`${active} 路控制中`;
-  $('channel-caption').textContent=connected?`${state.config.fans.length} 个风扇配置 · ${state.channels.length} 个控制通道`:'读数已过期';
-  $('service-caption').textContent=state.demo?'模拟设备 · 不写入真实硬件':state.background_service?'后台独立调速 · 关闭网页不影响运行':'临时前台服务 · 退出终端将停止';
-  $('mode-badge').textContent=state.demo?'演示模式':state.control_allowed?'后台已连接':'监控模式';
+  text($('service-value'),!connected?'状态未知':state.error?'需要检查':`${active} 路控制中`);
+  text($('channel-caption'),connected?`${state.config.fans.length} 个风扇配置 · ${state.channels.length} 个控制通道`:'读数已过期');
+  text($('service-caption'),state.demo?'模拟设备 · 不写入真实硬件':state.background_service?'后台独立调速 · 关闭网页不影响运行':'临时前台服务 · 退出终端将停止');
+  text($('mode-badge'),state.demo?'演示模式':state.control_allowed?'后台已连接':'监控模式');
   $('release-all').disabled=!editable()||(!active&&!state.identification&&!Object.keys(state.pending_autostart||{}).length);
   $('new-curve').disabled=!editable();$('scan-fans').disabled=!editable()||scanBusy;$('add-fan').disabled=!editable();$('import-config').disabled=!editable();$('export-config').disabled=!connected;
-  $('last-update').textContent=connected?`更新于 ${new Date(state.time*1000).toLocaleTimeString('zh-CN',{hour12:false})}`:'连接已断开';
+  text($('last-update'),connected?`更新于 ${new Date(state.time*1000).toLocaleTimeString('zh-CN',{hour12:false})}`:'连接已断开');
   let banner='';
   if(state.workspace_api!==2)banner='网页已更新，后台仍是旧版本。请重启 fancontrollx 服务后刷新页面；现有配置会保留。';
   else if(state.error)banner=`控制服务需要检查：${state.error}`;
   else if(state.demo)banner='演示模式：这里的操作仅作用于模拟设备，配置与真实设备分开保存。';
   else if(!state.channels.length)banner='尚未发现风扇控制通道。可先编辑离线配置，再到设备设置中绑定硬件。';
-  $('hardware-banner').classList.toggle('info',!!state.demo&&!state.error&&state.workspace_api===2);$('hardware-banner').hidden=!banner;$('hardware-banner').textContent=banner;
+  $('hardware-banner').classList.toggle('info',!!state.demo&&!state.error&&state.workspace_api===2);$('hardware-banner').hidden=!banner;text($('hardware-banner'),banner);
   if(currentTab==='control'){renderFanCards();renderLibrary();}
   else if(currentTab==='devices')renderDiscovery();
   else if(currentTab==='sensors')renderSensors();
@@ -119,12 +108,12 @@ function renderFanCards(){
         <button class="fan-curve-preview" data-edit-curve aria-label="编辑 ${esc(f.name)} 的曲线" ${disabled?'disabled':''}>${miniCurve(pointsFor(f),true)}<span class="preview-caption"><span>${pointsFor(f).length} 个节点${f.mode==='manual'?' · 手动模式，曲线未使用':''}</span><span>${icon('curve')}编辑曲线 ↗</span></span></button>
         <div class="card-footer"><span class="hint" data-live="policy"></span><div class="toolbar">${!f.identified&&c?`<button class="text-button" data-identify="${esc(c.id)}" ${disabled?'disabled':''}>确认设备</button>`:''}<button class="text-button" data-device ${disabled?'disabled':''}>${icon('settings')}设置</button></div></div><p class="card-feedback" data-live="feedback" role="status"></p>`;
     }
-    const live=(key,value)=>{const target=el.querySelector(`[data-live="${key}"]`);if(target)target.textContent=value;};
+    const live=(key,value)=>{const target=el.querySelector(`[data-live="${key}"]`);if(target)text(target,value);};
     const status=!connected?'连接中断':testing?'测试辨认中':state.pending_autostart?.[f.id]?'等待设备就绪':o.active?(o.fault?'保护运行':o.automatic?'显卡自动调速':'正在控制'):!f.identified?'待确认设备':c?'未启用控制':f.channel_id?'通道离线':'离线配置';
-    el.classList.toggle('is-active',connected&&!!o.active);el.classList.toggle('has-fault',connected&&!!o.active&&!!o.fault);live('status',status);el.querySelector('[data-live="status"]').className=`status-tag ${connected&&o.active?'active':''} ${connected&&o.fault&&o.active?'fault':''}`;
+    el.classList.toggle('is-active',connected&&!!o.active);el.classList.toggle('has-fault',connected&&!!o.active&&!!o.fault);live('status',status);attribute(el.querySelector('[data-live="status"]'),'class',`status-tag ${connected&&o.active?'active':''} ${connected&&o.fault&&o.active?'fault':''}`);
     live('actual',connected?fmt(o.actual,1):'—');live('target',connected?fmt(o.requested??o.target,1):'—');live('rpm',connected?fmt(o.rpm):'—');live('temperature',connected?fmt(o.temperature,1):'—');
     updateMiniCurve(el.querySelector('.fan-curve-preview>svg'),pointsFor(f),connected?o.temperature:null,f.mode);
-    el.querySelector('[data-live="progress"]').style.width=`${connected?Math.max(0,Math.min(100,o.actual||0)):0}%`;
+    const progress=el.querySelector('[data-live="progress"]'),width=`${connected?Math.max(0,Math.min(100,o.actual||0)):0}%`;if(progress.style.width!==width)progress.style.width=width;
     live('policy',o.active&&o.automatic?'曲线 0% · 显卡自动调速':requested?(state.background_service?'已保存 · 开机恢复':'本次运行有效'):c?.backend==='nvidia'?(c.mode===0?'显卡自动调速':'显卡原手动模式'):'保持原硬件控制');
     const message=cardMessages.get(f.id);const fault=connected&&o.active?o.fault:null;
     live('feedback',!connected?'读数已过期':pendingFans.has(f.id)?'正在应用…':fault||state.pending_autostart?.[f.id]||(o.active&&o.automatic?'由显卡决定转速与停转；曲线升高后自动接管':message?.text)||(o.active&&Math.abs((o.requested??o.target)-o.target)>1?'正在平滑调整':''));
@@ -147,8 +136,8 @@ function renderDiscovery(){
   }
   for(const el of document.querySelectorAll('[data-channel]')){const c=devices.find(c=>c.id===el.dataset.channel);el.querySelector('[data-rpm]').textContent=`${connected?fmt(c?.rpm):'—'} RPM`;el.querySelector('[data-duty]').textContent=`${connected?fmt(c?.duty,1):'—'}% 硬件输出`;}
 }
-function renderSensors(){$('sensor-table').innerHTML=[...state.sensors.map(s=>`<tr><td>${esc(s.name)}</td><td>${esc(s.chip)}</td><td>${s.kind==='cpu'?'CPU':s.kind==='gpu'?'GPU':'温度'}</td><td>${connected?fmt(s.value,1):'—'} °C</td></tr>`),...state.fans.map(f=>`<tr><td>${esc(f.name)}</td><td>${esc(f.chip)}</td><td>转速</td><td>${connected?fmt(f.rpm):'—'} RPM</td></tr>`)].join('');}
-function renderDiagnostics(){const row=(name,value)=>`<div class="diagnostic-row"><span>${esc(name)}</span><span>${esc(value)}</span></div>`;$('diagnostics-content').innerHTML=`<article class="panel diagnostic-card"><h3>本机服务</h3>${row('运行方式',state.background_service?'systemd 后台服务':'临时前台')}${row('硬件写入',state.control_allowed?'已允许':'仅监控')}${row('GPU 温度',state.gpu_error||'正常')}${row('NVIDIA 风扇接口',state.gpu_control_error||'正常')}${row('配置格式',`v${state.config.version}`)}${row('配置文件',state.demo?'data/config.demo.json':'data/config.json')}<p class="hint">首次升级保存前自动备份旧配置。更新代码后需重启服务；关闭网页不会停止后台调速。</p></article><article class="panel diagnostic-card"><h3>风扇控制通道</h3>${state.channels.map(c=>row(`${c.chip} · ${c.name}`,c.reason||`${fmt(c.duty,1)}% · ${c.watchdog?'硬件看门狗':c.software_watchdog?'独立进程守护':'无硬件看门狗'}`)).join('')||'<p class="hint">未检测到可用通道</p>'}</article><article class="panel diagnostic-card"><h3>维护</h3><p class="hint">查看状态：<code>systemctl status fancontrollx</code><br>更新后重启：<code>sudo systemctl restart fancontrollx</code><br>查看日志：<code>sudo journalctl -u fancontrollx -n 50 --no-pager</code></p></article>`;$('event-list').innerHTML=state.events.map(e=>`<div class="event-row"><time>${new Date(e.time*1000).toLocaleTimeString('zh-CN',{hour12:false})}</time><span>${esc(e.message)}</span></div>`).join('')||'<p class="hint">暂无运行事件</p>';}
+function renderSensors(){html($('sensor-table'),[...state.sensors.map(s=>`<tr><td>${esc(s.name)}</td><td>${esc(s.chip)}</td><td>${s.kind==='cpu'?'CPU':s.kind==='gpu'?'GPU':'温度'}</td><td>${connected?fmt(s.value,1):'—'} °C</td></tr>`),...state.fans.map(f=>`<tr><td>${esc(f.name)}</td><td>${esc(f.chip)}</td><td>转速</td><td>${connected?fmt(f.rpm):'—'} RPM</td></tr>`)].join(''));}
+function renderDiagnostics(){const row=(name,value)=>`<div class="diagnostic-row"><span>${esc(name)}</span><span>${esc(value)}</span></div>`;html($('diagnostics-content'),`<article class="panel diagnostic-card"><h3>本机服务</h3>${row('运行方式',state.background_service?'systemd 后台服务':'临时前台')}${row('硬件写入',state.control_allowed?'已允许':'仅监控')}${row('GPU 温度',state.gpu_error||'正常')}${row('NVIDIA 风扇接口',state.gpu_control_error||'正常')}${row('配置格式',`v${state.config.version}`)}${row('配置文件',state.demo?'data/config.demo.json':'data/config.json')}<p class="hint">首次升级保存前自动备份旧配置。更新代码后需重启服务；关闭网页不会停止后台调速。</p></article><article class="panel diagnostic-card"><h3>风扇控制通道</h3>${state.channels.map(c=>row(`${c.chip} · ${c.name}`,c.reason||`${fmt(c.duty,1)}% · ${c.watchdog?'硬件看门狗':c.software_watchdog?'独立进程守护':'无硬件看门狗'}`)).join('')||'<p class="hint">未检测到可用通道</p>'}</article><article class="panel diagnostic-card"><h3>维护</h3><p class="hint">查看状态：<code>systemctl status fancontrollx</code><br>更新后重启：<code>sudo systemctl restart fancontrollx</code><br>查看日志：<code>sudo journalctl -u fancontrollx -n 50 --no-pager</code></p></article>`);html($('event-list'),state.events.map(e=>`<div class="event-row"><time>${new Date(e.time*1000).toLocaleTimeString('zh-CN',{hour12:false})}</time><span>${esc(e.message)}</span></div>`).join('')||'<p class="hint">暂无运行事件</p>');}
 async function changeFan(id,changes){
   if(!editable()||pendingFans.has(id))return;const f=findFan(id);const expected=Object.fromEntries(Object.keys(changes).map(k=>[k,clone(f[k])]));pendingFans.add(id);cardMessages.delete(id);renderFanCards();
   try{await api('/api/fan',{id,changes,expected});cardMessages.set(id,{text:'已自动保存并应用'});await refresh();}
@@ -156,7 +145,7 @@ async function changeFan(id,changes){
   finally{pendingFans.delete(id);renderFanCards();}
 }
 function showDialog(id){$(id).showModal();$(id).scrollTop=0;}
-function closeDialog(id,force=false){if(dialogSaving)return;if(!force&&((id==='curve-dialog'&&curveEdit?.dirty)||(id==='device-dialog'&&deviceEdit?.dirty))&&!confirm('放弃尚未应用的修改？'))return;$(id).close();if(id==='curve-dialog')curveEdit=null;if(id==='device-dialog')deviceEdit=null;}
+async function closeDialog(id,force=false){if(dialogSaving)return;if(!force&&((id==='curve-dialog'&&curveEdit?.dirty)||(id==='device-dialog'&&deviceEdit?.dirty))&&!await confirmAction('放弃尚未应用的修改？','放弃修改'))return;$(id).close();if(id==='curve-dialog')curveEdit=null;if(id==='device-dialog')deviceEdit=null;}
 function openCurve({fanId=null,curveId=null,copy=false}={}){
   if(!editable())return;const f=fanId?findFan(fanId):null;const curve=findCurve(curveId||f?.curve_id);
   curveEdit={fanId:f?.id||null,baseFan:f?{points:clone(f.points),curve_id:f.curve_id}:null,base:curve&&!copy?clone(curve):null,name:curve?curve.name+(copy?' 副本':''):f?`${f.name} 曲线`:'新曲线',points:clone(curve?.points||f?.points||presets.default),dirty:false,selected:0,dragging:null};
@@ -166,32 +155,20 @@ function openCurve({fanId=null,curveId=null,copy=false}={}){
   $('curve-behavior-help').textContent=state.channels.some(c=>c.curve_zero_auto)?'预览不会改变风速。NVIDIA 曲线为 0% 时交回显卡自动模式，是否停转由显卡决定；正值按最低输出限制调速。应用后生效。':'预览不会改变风速。应用后，正在使用此曲线的风扇会按各自的限制和平滑设置调整。';
   $('preset').value='custom';errorIn('curve-error','');renderPoints();showDialog('curve-dialog');$('point-list').scrollTop=0;drawChart();
 }
-const chart={left:40,right:784,top:20,bottom:300};
-function domain(){return [Math.min(20,...curveEdit.points.map(p=>p[0])),Math.max(100,...curveEdit.points.map(p=>p[0]))];}
-function xy(t,d){const [lo,hi]=domain();return [chart.left+(t-lo)/(hi-lo)*(chart.right-chart.left),chart.bottom-d/100*(chart.bottom-chart.top)];}
-function eventPoint(event){const p=$('curve-chart').createSVGPoint();p.x=event.clientX;p.y=event.clientY;const v=p.matrixTransform($('curve-chart').getScreenCTM().inverse());const [lo,hi]=domain();return [Math.round(Math.max(-20,Math.min(120,lo+(v.x-chart.left)/(chart.right-chart.left)*(hi-lo)))),Math.round(Math.max(0,Math.min(100,(chart.bottom-v.y)/(chart.bottom-chart.top)*100)))];}
+const curvePlot=createCurvePlot($('curve-chart'));
+const eventPoint=event=>curvePlot.eventPoint(event);
 function drawChart(){
-  if(!curveEdit)return;const svg=$('curve-chart'),width=svg.clientWidth||800,height=svg.clientHeight||330;
-  svg.setAttribute('viewBox',`0 0 ${width} ${height}`);Object.assign(chart,{right:width-16,bottom:height-30});
-  const [lo,hi]=domain();let html='';
-  for(let d=0;d<=100;d+=20){const y=xy(lo,d)[1];html+=`<line x1="${chart.left}" y1="${y}" x2="${chart.right}" y2="${y}" stroke="var(--line)" stroke-dasharray="3 5"/><text x="${chart.left-10}" y="${y+3}" text-anchor="end" fill="var(--muted)" font-size="10">${d}</text>`;}
-  const tickStep=width<400?20:10;
-  for(let t=Math.ceil(lo/tickStep)*tickStep;t<=hi;t+=tickStep){const x=xy(t,0)[0];html+=`<line x1="${x}" y1="${chart.top}" x2="${x}" y2="${chart.bottom}" stroke="var(--grid)"/><text x="${x}" y="${chart.bottom+20}" text-anchor="middle" fill="var(--muted)" font-size="10">${t}°</text>`;}
-  const coords=[xy(lo,curveEdit.points[0][1]),...curveEdit.points.map(p=>xy(...p)),xy(hi,curveEdit.points.at(-1)[1])];const line=coords.map((p,i)=>`${i?'L':'M'}${p[0]},${p[1]}`).join(' ');html+=`<path d="${line} L${chart.right},${chart.bottom} L${chart.left},${chart.bottom} Z" fill="var(--accent)" opacity=".07"/><path d="${line}" fill="none" stroke="var(--accent)" stroke-width="2.5"/>`;
-  const f=findFan(curveEdit.fanId);const temp=f?sourceTemperature(f):null;
-  if(connected&&temp!=null){const x=xy(Math.max(lo,Math.min(hi,temp)),0)[0],y=xy(temp,interpolate(curveEdit.points,temp))[1];html+=`<line x1="${x}" y1="${chart.top}" x2="${x}" y2="${chart.bottom}" stroke="var(--blue)" stroke-dasharray="4 5"/><circle cx="${x}" cy="${y}" r="5" fill="var(--blue)"/>`;}
-  curveEdit.points.forEach((p,i)=>{const [x,y]=xy(...p);html+=`<g data-node="${i}" tabindex="0" role="slider" aria-label="节点 ${i+1}，${p[0]} 摄氏度，${p[1]} 百分比" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${p[1]}" style="cursor:grab"><circle cx="${x}" cy="${y}" r="15" fill="transparent"/><circle cx="${x}" cy="${y}" r="${i===curveEdit.selected?6:4.5}" fill="var(--panel)" stroke="var(--accent)" stroke-width="2"/></g>`;});
-  // Keep focused graph nodes stable between polling updates and keyboard steps.
-  const focus=$('curve-chart').contains(document.activeElement)?document.activeElement.dataset.node:null;
-  $('curve-chart').innerHTML=html;if(focus!=null)$('curve-chart').querySelector(`[data-node="${focus}"]`)?.focus({preventScroll:true});
+  if(!curveEdit)return;
+  const f=findFan(curveEdit.fanId),temp=f?sourceTemperature(f):null;
+  curvePlot.draw(curveEdit.points,curveEdit.selected,connected?temp:null);
   const zeroAuto=f&&temp!=null&&state.channels.find(c=>c.id===f.channel_id)?.curve_zero_auto&&interpolate(curveEdit.points,temp)===0;
-  $('chart-current').textContent=f?(connected&&temp!=null?`${fmt(temp,1)}°C · 曲线预览 ${fmt(interpolate(curveEdit.points,temp),1)}%${zeroAuto?' → 显卡自动模式':''}`:'温度源不可用'):'曲线预览';
+  text($('chart-current'),f?(connected&&temp!=null?`${fmt(temp,1)}°C · 曲线预览 ${fmt(interpolate(curveEdit.points,temp),1)}%${zeroAuto?' → 显卡自动模式':''}`:'温度源不可用'):'曲线预览');
 }
 new ResizeObserver(()=>{if(curveEdit&&curveEdit.dragging===null)drawChart();}).observe($('curve-chart'));
 function renderPoints(){
   const count=curveEdit.points.length,list=$('point-list'),scrollTop=list.scrollTop;
   $('point-count').textContent=`${count} 个`;
-  list.innerHTML=curveEdit.points.map((p,i)=>`<div class="point ${i===curveEdit.selected?'selected':''}"><div class="point-top"><span>节点 ${i+1}</span><button type="button" data-remove-point="${i}" aria-label="删除节点 ${i+1}" ${count<=2?'disabled':''}>×</button></div><div class="point-values"><label>温度 °C<input type="number" value="${p[0]}" min="-20" max="120" step="1" data-point="${i}" data-axis="0" aria-label="节点 ${i+1} 温度"></label><span>→</span><label>输出 %<input type="number" value="${p[1]}" min="0" max="100" step="1" data-point="${i}" data-axis="1" aria-label="节点 ${i+1} 输出"></label></div></div>`).join('');
+  list.innerHTML=curveEdit.points.map((p,i)=>`<div class="point ${i===curveEdit.selected?'selected':''}"><div class="point-top"><span>节点 ${i+1}</span><button type="button" data-remove-point="${i}" aria-label="删除节点 ${i+1}" ${count<=2?'disabled':''}>${icon('x')}</button></div><div class="point-values"><label>温度 °C<input type="number" value="${p[0]}" min="-20" max="120" step="1" data-point="${i}" data-axis="0" aria-label="节点 ${i+1} 温度"></label><span>→</span><label>输出 %<input type="number" value="${p[1]}" min="0" max="100" step="1" data-point="${i}" data-axis="1" aria-label="节点 ${i+1} 输出"></label></div></div>`).join('');
   list.scrollTop=scrollTop;
   const selected=list.children[curveEdit.selected];
   if(selected&&list.clientHeight){
@@ -295,7 +272,7 @@ $('fan-cards').addEventListener('change',async event=>{
   if(el.dataset.field==='curve_id'&&el.value!=='@manual')await changeFan(id,{mode:'curve',curve_id:el.value||null});
 });
 $('new-curve').addEventListener('click',()=>openCurve());
-$('curve-library').addEventListener('click',async event=>{if(event.target.closest('[data-create-curve]')){openCurve();return;}const edit=event.target.closest('[data-library-edit]'),copy=event.target.closest('[data-library-copy]'),remove=event.target.closest('[data-library-delete]');if(edit)openCurve({curveId:edit.dataset.libraryEdit});if(copy)openCurve({curveId:copy.dataset.libraryCopy,copy:true});if(remove){const curve=clone(findCurve(remove.dataset.libraryDelete));if(!confirm(`删除曲线“${curve.name}”？`))return;remove.disabled=true;try{await api('/api/curve/delete',{id:curve.id,expected:curve});await refresh();toast('曲线已删除');}catch(error){toast(error.message,true);remove.disabled=false;}}});
+$('curve-library').addEventListener('click',async event=>{if(event.target.closest('[data-create-curve]')){openCurve();return;}const edit=event.target.closest('[data-library-edit]'),copy=event.target.closest('[data-library-copy]'),remove=event.target.closest('[data-library-delete]');if(edit)openCurve({curveId:edit.dataset.libraryEdit});if(copy)openCurve({curveId:copy.dataset.libraryCopy,copy:true});if(remove){const curve=clone(findCurve(remove.dataset.libraryDelete));if(!await confirmAction(`删除曲线“${curve.name}”？`,'删除曲线'))return;remove.disabled=true;try{await api('/api/curve/delete',{id:curve.id,expected:curve});await refresh();toast('曲线已删除');}catch(error){toast(error.message,true);remove.disabled=false;}}});
 $('curve-name').addEventListener('input',()=>{curveEdit.dirty=true;});$('curve-share').addEventListener('change',()=>{curveEdit.dirty=true;$('curve-name').disabled=!$('curve-share').checked;});
 $('preset').addEventListener('change',()=>{const p=presets[$('preset').value];if(p){curveEdit.points=clone(p);curveEdit.selected=0;curveEdit.dirty=true;renderPoints();drawChart();}});
 $('point-list').addEventListener('change',event=>{const el=event.target;if(!el.matches('[data-point]'))return;if(el.value===''||!Number.isFinite(Number(el.value))){renderPoints();return;}const i=Number(el.dataset.point),p=[...curveEdit.points[i]];p[Number(el.dataset.axis)]=Number(el.value);setPoint(i,...p);renderPoints();});
@@ -321,7 +298,7 @@ $('device-form').addEventListener('submit',async event=>{
   const expected=Object.fromEntries(Object.keys(changes).map(k=>[k,e.base[k]]));dialogSaving=true;$('save-device').disabled=true;errorIn('device-error','');
   try{await api('/api/fan',{id:e.id,changes,expected});await refresh();dialogSaving=false;closeDialog('device-dialog',true);toast('风扇设置已保存');}catch(error){errorIn('device-error',error.message);}finally{dialogSaving=false;$('save-device').disabled=false;}
 });
-$('delete-fan').addEventListener('click',async()=>{if(dialogSaving||!editable()||!confirm('删除此风扇配置并停止控制？硬件通道仍可重新扫描发现。'))return;dialogSaving=true;try{const config=clone(state.config);config.fans=config.fans.filter(f=>f.id!==deviceEdit.id);await api('/api/config',{...config,expected_revision:state.config_revision});await refresh();dialogSaving=false;closeDialog('device-dialog',true);toast('风扇配置已删除');}catch(error){errorIn('device-error',error.message);}finally{dialogSaving=false;}});
+$('delete-fan').addEventListener('click',async()=>{if(dialogSaving||!editable()||!await confirmAction('删除此风扇配置并停止控制？硬件通道仍可重新扫描发现。','删除配置'))return;dialogSaving=true;try{const config=clone(state.config);config.fans=config.fans.filter(f=>f.id!==deviceEdit.id);await api('/api/config',{...config,expected_revision:state.config_revision});await refresh();dialogSaving=false;closeDialog('device-dialog',true);toast('风扇配置已删除');}catch(error){errorIn('device-error',error.message);}finally{dialogSaving=false;}});
 $('scan-fans').addEventListener('click',async()=>{if(scanBusy||!editable())return;scanBusy=true;render();try{const r=await api('/api/scan',{});await refresh();toast(`扫描完成，新增 ${r.added} 路设备`);}catch(error){toast(error.message,true);}finally{scanBusy=false;render();}});
 $('add-fan').addEventListener('click',()=>{$('new-fan-name').value='';errorIn('add-error','');showDialog('add-dialog');});
 $('add-form').addEventListener('submit',async event=>{event.preventDefault();if(dialogSaving||!editable())return;dialogSaving=true;try{const config=clone(state.config);config.fans.push({id:crypto.randomUUID(),name:$('new-fan-name').value.trim()});await api('/api/config',{...config,expected_revision:state.config_revision});await refresh();dialogSaving=false;closeDialog('add-dialog',true);toast('离线配置已添加');}catch(error){errorIn('add-error',error.message);}finally{dialogSaving=false;}});
@@ -331,7 +308,7 @@ function abandonIdentification(){if(!identifyingChannel||state?.identification?.
 window.addEventListener('pagehide',abandonIdentification);document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')abandonIdentification();});
 $('release-all').addEventListener('click',async()=>{if(!editable())return;$('release-all').disabled=true;try{await api('/api/release-all',{});await refresh();toast('已停止全部控制并恢复原硬件状态');}catch(error){toast(error.message,true);await refresh();}});
 $('retry').addEventListener('click',refresh);$('export-config').addEventListener('click',()=>download('fancontrollx-config.json',state.config));$('download-diagnostics').addEventListener('click',()=>{const {csrf_token,...safe}=state;download('fancontrollx-diagnostics.json',safe);});$('import-config').addEventListener('click',()=>$('import-file').click());
-$('import-file').addEventListener('change',async()=>{const file=$('import-file').files[0];if(!file)return;try{if(file.size>256*1024)throw new Error('配置文件超过 256 KB');const config=JSON.parse(await file.text());if(!confirm('导入会替换此机器的全部配置，并按其中的控制开关应用。继续？'))return;await api('/api/config',{...config,expected_revision:state.config_revision});await refresh();toast('配置已导入；旧版格式已兼容读取');}catch(error){toast(error.message,true);}finally{$('import-file').value='';}});
+$('import-file').addEventListener('change',async()=>{const file=$('import-file').files[0];if(!file)return;try{if(file.size>256*1024)throw new Error('配置文件超过 256 KB');const config=JSON.parse(await file.text());if(!await confirmAction('导入会替换此机器的全部配置，并按其中的控制开关应用。继续？','导入并应用'))return;await api('/api/config',{...config,expected_revision:state.config_revision});await refresh();toast('配置已导入；旧版格式已兼容读取');}catch(error){toast(error.message,true);}finally{$('import-file').value='';}});
 window.addEventListener('beforeunload',event=>{if(curveEdit?.dirty||deviceEdit?.dirty){event.preventDefault();event.returnValue='';}});
 document.addEventListener('keydown',event=>{if((event.ctrlKey||event.metaKey)&&event.key==='s'){event.preventDefault();if($('curve-dialog').open)$('curve-form').requestSubmit();else if($('device-dialog').open)$('device-form').requestSubmit();}});
 let pollTimer, pollGeneration=0;
