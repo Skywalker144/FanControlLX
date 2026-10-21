@@ -27,6 +27,7 @@ impl Drop for Temp {
 }
 struct Mock {
     sample: Snapshot,
+    samples: usize,
     duties: std::collections::HashMap<String, f64>,
     acquires: usize,
     writes: usize,
@@ -39,7 +40,8 @@ struct Mock {
 struct MockHardware(Arc<Mutex<Mock>>);
 impl Hardware for MockHardware {
     fn sample(&mut self, _: bool) -> Result<Snapshot> {
-        let m = self.0.lock().unwrap();
+        let mut m = self.0.lock().unwrap();
+        m.samples += 1;
         let mut s = m.sample.clone();
         for c in &mut s.channels {
             c["duty"] = json!(m.duties[text(&c["id"])]);
@@ -86,6 +88,7 @@ fn setup(managed: bool) -> (Temp, Engine, MockHardware, String) {
             .map(|c| (text(&c["id"]).into(), num(&c["duty"])))
             .collect(),
         sample: s,
+        samples: 0,
         acquires: 0,
         writes: 0,
         restores: 0,
@@ -811,8 +814,14 @@ fn identity_and_rescan_preserve_curve_source_and_do_not_activate() {
         &json!({"channel_id":"demo/pwm1","name":"CPU Fan","device_kind":"fan"}),
     )
     .unwrap();
+    let samples = h.0.lock().unwrap().samples;
     e.scan(true).unwrap();
     e.scan(true).unwrap();
+    assert_eq!(
+        h.0.lock().unwrap().samples - samples,
+        2,
+        "One fresh hardware sample per manual scan"
+    );
     assert_eq!(array(&e.config["fans"]).len(), 3);
     assert_eq!(e.config["fans"][0]["points"], points);
     assert_eq!(e.config["fans"][0]["sensor_ids"], json!(["@gpu"]));
