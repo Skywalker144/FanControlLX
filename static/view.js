@@ -1,49 +1,55 @@
 import {miniCurve, updateMiniCurve} from './curve.js';
+import {icon, text, attribute, installTheme} from './ui.js';
 
 const $=id=>document.getElementById(id);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=v=>v==null?'—':Number(v).toLocaleString('zh-CN',{maximumFractionDigits:1});
 let state,connected=false,timer,generation=0,sequence=0,applied=0;
-function theme(value){
-  document.documentElement.dataset.theme=value;
-  $('theme-toggle').textContent=value==='dark'?'浅色主题':'深色主题';
-}
-try{theme(localStorage.getItem('fancontrollx-theme')==='dark'?'dark':'light');}catch{theme('light');}
-$('theme-toggle').onclick=()=>{
-  const value=document.documentElement.dataset.theme==='dark'?'light':'dark';
-  theme(value);try{localStorage.setItem('fancontrollx-theme',value);}catch{}
-};
+installTheme($('theme-toggle'));
 function render(){
   $('connection-error').hidden=connected;
-  $('connection-text').textContent=connected?'已连接 · 只读观看':'连接中断';
-  $('cpu-temp').textContent=fmt(connected?state?.cpu:null);
-  $('gpu-temp').textContent=fmt(connected?state?.gpu:null);
-  $('service-value').textContent=connected?`${state.fans.filter(f=>f.output?.active).length} 路控制中`:'状态未知';
+  text($('connection-text'),connected?'已连接 · 只读观看':'连接中断');
+  text($('cpu-temp'),fmt(connected?state?.cpu:null));
+  text($('gpu-temp'),fmt(connected?state?.gpu:null));
+  text($('service-value'),connected?`${state.fans.filter(f=>f.output?.active).length} 路控制中`:'状态未知');
   if(!state)return;
-  $('machine-name').textContent=state.hostname;
-  $('version').textContent=`v${state.version}`;
-  $('fan-count').textContent=state.fans.length;
+  text($('machine-name'),state.hostname);
+  text($('version'),`v${state.version}`);
+  text($('fan-count'),state.fans.length);
   $('empty').hidden=state.fans.length!==0;
-  $('service-caption').textContent=state.demo?'演示设备 · 不写入真实硬件':state.background_service?'后台独立运行 · 关闭网页不影响控制':'临时前台服务 · 退出服务将停止控制';
+  text($('service-caption'),state.demo?'演示设备 · 不写入真实硬件':state.background_service?'后台独立运行 · 关闭网页不影响控制':'临时前台服务 · 退出服务将停止控制');
   $('service-error').hidden=!state.error;
-  $('service-error').textContent=state.error||'';
+  text($('service-error'),state.error||'');
+  const cards=new Map([...$('fan-cards').children].map(card=>[card.dataset.fan,card]));
   const ids=new Set(state.fans.map(f=>f.id));
-  for(const card of $('fan-cards').children)if(!ids.has(card.dataset.fan))card.remove();
+  for(const [id,card] of cards)if(!ids.has(id)){card.remove();cards.delete(id);}
   for(const [index,f] of state.fans.entries()){
-    let card=[...$('fan-cards').children].find(c=>c.dataset.fan===f.id);
+    let card=cards.get(f.id);
     if(!card){card=document.createElement('article');card.className='fan-card view-card';card.dataset.fan=f.id;$('fan-cards').append(card);}
-    const o=f.output||{},value=k=>fmt(connected?o[k]:null);
-    const status=!connected?'读数已过期':f.pending?'等待接管':o.status||'等待采样';
+    const signature=JSON.stringify([f.name,f.mode,f.curve_name,f.points]);
+    if(card._signature!==signature){
+      card._signature=signature;
+      card.innerHTML=`<div class="card-top"><span class="fan-symbol">${icon('fan')}</span><div class="card-name"><h3>${esc(f.name)}</h3><div class="chip-label">${f.mode==='manual'?'手动模式':'曲线模式'} · ${esc(f.curve_name||'独立曲线')}</div></div><span data-live="status" class="status-tag"></span></div>
+        <div class="fan-values"><div><span class="value-label">当前输出 <span class="target-reading">目标 <span data-live="target"></span></span></span><div class="output-reading"><strong data-live="actual"></strong><small>% 输出</small></div></div><div class="reading"><span data-live="rpm"></span> RPM<br><span data-live="temperature"></span> °C 输入</div></div><div class="progress"><i data-live="progress"></i></div>
+        <div class="fan-curve-preview">${miniCurve(f.points,true)}<div class="preview-caption">${f.points.length} 个节点${f.mode==='manual'?' · 手动模式，曲线未使用':''}</div></div><p class="view-fault" data-live="fault" hidden></p>`;
+      card._live=Object.fromEntries([...card.querySelectorAll('[data-live]')].map(el=>[el.dataset.live,el]));
+      card._curve=card.querySelector('.fan-curve-preview>svg');
+    }
+    const o=f.output||{},live=card._live,value=k=>fmt(connected?o[k]:null);
     const active=connected&&!!o.active,fault=active&&!!o.fault;
     card.classList.toggle('is-active',active);card.classList.toggle('has-fault',fault);
-    const body=`<div class="card-top"><span class="fan-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M10 10C4 10 4 3 8 3c4 0 5 4 4 7m2 0c0-6 7-6 7-2 0 4-4 5-7 4m0 2c6 0 6 7 2 7-4 0-5-4-7-4m-2 0c0 6-7 6-7 2 0-4 4-5 7-4"/></svg></span><div class="card-name"><h3>${esc(f.name)}</h3><div class="chip-label">${f.mode==='manual'?'手动模式':'曲线模式'} · ${esc(f.curve_name||'独立曲线')}</div></div><span class="status-tag ${active?'active':''} ${fault?'fault':''}">${esc(status)}</span></div>
-      <div class="fan-values"><div><span class="value-label">当前输出 <span class="target-reading">目标 ${connected&&o.automatic?'自动':`${value('target')}%`}</span></span><div class="output-reading"><strong>${value('actual')}</strong><small>% 输出</small></div></div><div class="reading"><span>${value('rpm')}</span> RPM<br><span>${value('temperature')}</span> °C 输入</div></div><div class="progress"><i style="width:${connected?Math.max(0,Math.min(100,o.actual||0)):0}%"></i></div>
-      <div class="fan-curve-preview">${miniCurve(f.points,true)}<div class="preview-caption">${f.points.length} 个节点${f.mode==='manual'?' · 手动模式，曲线未使用':''}</div></div>${connected&&(o.fault||f.pending)?`<p class="view-fault">${esc(o.fault||f.pending)}</p>`:''}`;
-    if(card._body!==body){card.innerHTML=body;card._body=body;}
-    updateMiniCurve(card.querySelector('.fan-curve-preview>svg'),f.points,connected?o.temperature:null,f.mode);
+    text(live.status,!connected?'读数已过期':f.pending?'等待接管':o.status||'等待采样');
+    attribute(live.status,'class',`status-tag ${active?'active':''} ${fault?'fault':''}`);
+    text(live.target,connected&&o.automatic?'自动':`${value('target')}%`);
+    for(const key of ['actual','rpm','temperature'])text(live[key],value(key));
+    const width=`${connected?Math.max(0,Math.min(100,o.actual||0)):0}%`;
+    if(live.progress.style.width!==width)live.progress.style.width=width;
+    const message=connected?(o.fault||f.pending||''):'';
+    text(live.fault,message);if(live.fault.hidden!==!message)live.fault.hidden=!message;
+    updateMiniCurve(card._curve,f.points,connected?o.temperature:null,f.mode);
     if($('fan-cards').children[index]!==card)$('fan-cards').insertBefore(card,$('fan-cards').children[index]||null);
   }
-  $('last-update').textContent=connected?`采样于 ${new Date(state.sample_time*1000).toLocaleTimeString('zh-CN',{hour12:false})}`:'读数已过期';
+  text($('last-update'),connected?`采样于 ${new Date(state.sample_time*1000).toLocaleTimeString('zh-CN',{hour12:false})}`:'读数已过期');
 }
 async function refresh(){
   const request=++sequence;
