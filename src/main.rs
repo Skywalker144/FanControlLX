@@ -9,6 +9,7 @@ mod nvml;
 mod perf_tests;
 mod runtime;
 mod server;
+mod telemetry;
 #[cfg(test)]
 mod tests;
 mod writer;
