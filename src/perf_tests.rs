@@ -100,5 +100,29 @@ fn benchmark_control_cycles() {
             10000,
             || engine.tick().unwrap(),
         );
+        let full = engine.state(None, None);
+        let revision = full["config_revision"].as_str().unwrap();
+        let view = engine.view_state(None, None);
+        let view_revision = view["view_revision"].as_str().unwrap();
+        let cursor = view["history_cursor"].as_u64().unwrap();
+        measure(&format!("editor_delta_{count}_fans"), 2000, || {
+            std::hint::black_box(engine.state(Some(revision), Some(f64::MAX)));
+        });
+        measure(&format!("viewer_delta_{count}_fans"), 2000, || {
+            std::hint::black_box(engine.view_state(Some(view_revision), Some(cursor)));
+        });
+        let mut config = engine.config.clone();
+        for fan in config["fans"].as_array_mut().unwrap() {
+            fan["smoothing_s"] = json!(60);
+        }
+        engine.update(&config, None).unwrap();
+        // Isolate policy calculation from Demo's allocation-heavy sampler.
+        // Advance deterministic time so the smoothing window stays full.
+        let mut now = engine.now();
+        measure(&format!("policy_60s_smoothing_{count}_fans"), 10000, || {
+            now += 0.5;
+            let sample = std::mem::take(&mut engine.snapshot);
+            engine.tick_with(sample, now).unwrap();
+        });
     }
 }
