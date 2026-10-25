@@ -116,7 +116,7 @@ header { display: flex; justify-content: space-between; align-items: center; gap
 .eyebrow span { color: var(--line); padding: 0 10px; }
 header p { color: var(--muted); font-size: var(--text-label); margin-top: 7px; }
 .toolbar { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
-.button { display: inline-flex; justify-content: center; align-items: center; gap: 7px; border: 1px solid transparent; border-radius: var(--radius-control); padding: 8px 13px; font-size: var(--text-label); font-weight: 500; min-height: var(--control-height); white-space: nowrap; }
+.button { text-decoration: none; display: inline-flex; justify-content: center; align-items: center; gap: 7px; border: 1px solid transparent; border-radius: var(--radius-control); padding: 8px 13px; font-size: var(--text-label); font-weight: 500; min-height: var(--control-height); white-space: nowrap; }
 .button .ui-icon { width: 15px; height: 15px; }
 .primary { background: linear-gradient(var(--primary),var(--primary-end)); color: var(--on-primary); box-shadow: 0 1px 3px #0002, inset 0 1px 0 #ffffff24; border-color: var(--primary); }
 .primary:hover:not(:disabled) { filter: brightness(1.12); box-shadow: 0 2px 6px #0003; }
@@ -257,6 +257,8 @@ input[type=range] { display: block; width: 100%; accent-color: var(--accent); he
 .curve-empty .button { margin: 0 0 0 auto; }
 .curve-card svg:not(.ui-icon) { width: 100%; height: 75px; display: block; margin: 12px 0; }
 .curve-card .toolbar { justify-content: space-between; margin-top: 10px; }
+.library-curve-preview { height: 75px; margin: 12px 0; }
+.library-curve-preview svg:not(.ui-icon) { margin: 0; }
 .curve-card p { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
 .discovery-card .toolbar { margin-top: 18px; }
 .discovery-readings { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-variant-numeric: tabular-nums; }
