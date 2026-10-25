@@ -353,6 +353,77 @@ class RustGPUProcessTests(unittest.TestCase):
         self.assertEqual(next(c for c in state()["channels"] if c.get("backend") == "nvidia")["mode"], 0)
         self.assertFalse((self.data / "writes").exists())
 
+    def test_monitor_reuses_gpu_layout_but_refreshes_values_and_topology(self):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        self.process = subprocess.Popen(
+            [str(BINARY), "--port", str(port), "--data-dir", str(self.data)],
+            env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        url = f"http://127.0.0.1:{port}"
+
+        def state():
+            with opener.open(url + "/api/state", timeout=5) as response:
+                return json.load(response)
+
+        def wait(predicate):
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                try:
+                    current = state()
+                    if predicate(current):
+                        return current
+                except OSError:
+                    pass
+                time.sleep(.05)
+            self.fail("GPU sample did not update")
+
+        def channels(s):
+            return [c for c in s["channels"] if c.get("backend") == "nvidia"]
+
+        current = wait(lambda s: len(channels(s)) == 1)
+        token = current["csrf_token"]
+        original_reason = channels(current)[0]["reason"]
+        scans = (self.data / "enumerations").read_text()
+        (self.data / "gpu-state").write_text("1 65")
+        (self.data / "temperature").write_text("72")
+        current = wait(lambda s: channels(s)[0]["duty"] == 65
+                       and any(r["kind"] == "gpu" and r["value"] == 72 for r in s["sensors"]))
+        self.assertEqual(channels(current)[0]["mode"], 1)
+        self.assertEqual(next(f for f in current["fans"] if f["chip"] == "nvidia")["rpm"], 1300)
+        (self.data / "fail-read").touch()
+        (self.data / "temperature").write_text("invalid")
+        current = wait(lambda s: channels(s)[0]["mode"] is None)
+        self.assertFalse(channels(current)[0]["writable"])
+        self.assertTrue(next(r for r in current["sensors"] if r["kind"] == "gpu")["value"] is None)
+        (self.data / "fail-read").unlink()
+        (self.data / "temperature").write_text("45")
+        current = wait(lambda s: channels(s)[0]["mode"] == 1)
+        self.assertEqual(channels(current)[0]["reason"], original_reason)
+        self.assertEqual((self.data / "enumerations").read_text(), scans)
+
+        def scan():
+            request = urllib.request.Request(url + "/api/scan", data=b"{}", headers={
+                "Content-Type": "application/json", "X-FanControl-Token": token})
+            with opener.open(request) as response:
+                self.assertEqual(response.status, 200)
+            return state()
+
+        (self.data / "fan-count").write_text("2")
+        current = scan()
+        self.assertEqual(len(channels(current)), 2)
+        self.assertEqual(len([f for f in current["fans"] if f["chip"] == "nvidia"]), 2)
+        (self.data / "fan-count").write_text("1")
+        self.assertEqual(len(channels(scan())), 1)
+        (self.data / "gpu-hidden").touch()
+        current = scan()
+        self.assertEqual(channels(current), [])
+        self.assertFalse(any(f["chip"] == "nvidia" for f in current["fans"]))
+        (self.data / "gpu-hidden").unlink()
+        self.assertEqual(len(channels(scan())), 1)
+        self.assertFalse((self.data / "writes").exists())
+
     def test_monitor_does_not_reuse_cached_readings_during_stalled_sample(self):
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
