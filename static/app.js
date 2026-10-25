@@ -1,5 +1,5 @@
 import {interpolate, miniCurve, updateMiniCurve} from './curve.js';
-import {icon, text, attribute, html, spark, updateOutputBar, initFanColumns, formatTime} from './ui.js';
+import {icon, text, attribute, html, spark, updateOutputBar, initFanColumns, formatTime, createCardVisibility} from './ui.js';
 import {createCurvePlot} from './curve-editor.js';
 import {createConfirmation} from './confirm.js';
 
@@ -19,10 +19,23 @@ let curveEdit=null, deviceEdit=null, identifyingChannel=null, identifyBusy=false
 const pendingFans=new Set(), editingRanges=new Set(), cardSignatures=new Map(), cardMessages=new Map();
 let discoverySignature='', librarySignature='', libraryConfig, libraryEditable, fanDrag=null, orderSaving=false;
 let cardConfig,cardSources='',commonCardSignature='';
+let indexedConfig,fanIndex=new Map(),curveIndex=new Map();
+const fanConfigSignatures=new WeakMap();
+const cardVisibility=createCardVisibility(()=>{if(state&&currentTab==='control')renderFanCards();});
 let lastEditorHeartbeat=0;
 const editable = () => connected && state?.workspace_api===2;
-const findFan = id => state?.config.fans.find(f=>f.id===id);
-const findCurve = id => state?.config.curves?.find(c=>c.id===id);
+function indexConfig(){
+  if(indexedConfig===state?.config)return;
+  indexedConfig=state?.config;
+  fanIndex=new Map((indexedConfig?.fans||[]).map(f=>[f.id,f]));
+  curveIndex=new Map((indexedConfig?.curves||[]).map(c=>[c.id,c]));
+}
+const findFan = id => {indexConfig();return fanIndex.get(id);};
+const findCurve = id => {indexConfig();return curveIndex.get(id);};
+function fanConfigSignature(f){
+  if(!fanConfigSignatures.has(f))fanConfigSignatures.set(f,JSON.stringify(f));
+  return fanConfigSignatures.get(f);
+}
 const pointsFor = f => findCurve(f.curve_id)?.points || f.points;
 function toast(message,error=false){clearTimeout(toastTimer);$('toast').textContent=message;$('toast').classList.toggle('error',error);$('toast').hidden=false;toastTimer=setTimeout(()=>{$('toast').hidden=true;},error?7000:3500);}
 function errorIn(id,message){$(id).textContent=message;$(id).hidden=!message;}
@@ -97,7 +110,33 @@ function render(){
   if(curveEdit&&curveEdit.dragging===null)drawChart();
 }
 function sourceOptions(f){const choices=[...sources,...state.sensors.filter(s=>s.kind==='gpu').map(s=>[s.id,s.name])];const value=f.sensor_ids.length===1&&choices.some(s=>s[0]===f.sensor_ids[0])?f.sensor_ids[0]:'@custom';return choices.map(([id,name])=>`<option value="${esc(id)}" ${id===value?'selected':''}>${esc(name)}</option>`).join('')+`<option value="@custom" ${value==='@custom'?'selected':''}>自定义组合…</option>`;}
-function curveOptions(f){return (f.mode==='manual'?'<option value="@manual" selected disabled hidden>曲线</option>':'')+`<option value="" ${f.mode==='curve'&&!f.curve_id?'selected':''}>独立曲线</option>`+(state.config.curves||[]).map(c=>`<option value="${esc(c.id)}" ${f.mode==='curve'&&f.curve_id===c.id?'selected':''}>${esc(c.name)}</option>`).join('');}
+function curveOptions(f,expanded=false){
+  const curves=state.config.curves||[];
+  // Large libraries otherwise create fans × curves native option elements.
+  // Populate the complete native menu before pointer or keyboard interaction.
+  if(!expanded&&curves.length>16){
+    if(f.mode==='manual')return '<option value="@manual" selected disabled hidden>曲线</option>';
+    const curve=findCurve(f.curve_id);
+    return `<option value="${esc(curve?.id||'')}" selected>${esc(curve?.name||'独立曲线')}</option>`;
+  }
+  return (f.mode==='manual'?'<option value="@manual" selected disabled hidden>曲线</option>':'')+`<option value="" ${f.mode==='curve'&&!f.curve_id?'selected':''}>独立曲线</option>`+curves.map(c=>`<option value="${esc(c.id)}" ${f.mode==='curve'&&f.curve_id===c.id?'selected':''}>${esc(c.name)}</option>`).join('');
+}
+function expandCurveOptions(event){
+  const select=event.target.closest('[data-field="curve_id"]');
+  if(!select||select.disabled||(state.config.curves||[]).length<=16||select.options.length>1)return;
+  const f=findFan(select.closest('[data-fan]').dataset.fan);
+  if(f)select.innerHTML=curveOptions(f,true);
+}
+$('fan-cards').addEventListener('focusin',expandCurveOptions);
+$('fan-cards').addEventListener('pointerdown',expandCurveOptions);
+$('fan-cards').addEventListener('focusout',event=>{
+  const select=event.target.closest('[data-field="curve_id"]');
+  if(select&&(state.config.curves||[]).length>16&&select.options.length>1){
+    const selected=select.selectedOptions[0];
+    if(selected)select.replaceChildren(selected);
+  }
+});
+
 function renderFanCards(){
   text($('fan-count'),state.config.fans.length);
   const ids=new Set(state.config.fans.map(f=>f.id));
@@ -112,46 +151,64 @@ function renderFanCards(){
     cardConfig=state.config;cardSources=sourceSignature;
   }
   const commonSignature=commonCardSignature;
-  for(const el of [...$('fan-cards').children])if(!ids.has(el.dataset.fan)){el.remove();cardSignatures.delete(el.dataset.fan);}
+  for(const el of [...$('fan-cards').children])if(!ids.has(el.dataset.fan)){cardVisibility.remove(el);el.remove();cardSignatures.delete(el.dataset.fan);cardMessages.delete(el.dataset.fan);}
   for(const [index,f] of state.config.fans.entries()){
     const o=state.outputs[f.id]||{},c=channels.get(f.channel_id);
     const requested=state.background_service?f.autostart:!!o.active;
     const low=Math.max(f.min_duty,c?.min_duty||0),high=Math.max(low,Math.min(f.max_duty,c?.max_duty||100));
     const testing=state.identification?.channel_id===f.channel_id;
     const disabled=!editable()||pendingFans.has(f.id);
-    const signature=JSON.stringify([f,connected,state.workspace_api,state.control_allowed,state.background_service,c?.writable,c?.name,low,high,pendingFans.has(f.id),requested,orderSaving]);
+    const configSignature=fanConfigSignature(f);
+    const signature=JSON.stringify([connected,state.workspace_api,state.control_allowed,state.background_service,c?.writable,c?.name,low,high,pendingFans.has(f.id),requested,orderSaving]);
     let el=cards.get(f.id);
     if(!el){el=document.createElement('article');el.className='fan-card';el.dataset.fan=f.id;$('fan-cards').append(el);}
     if(!fanDrag&&!orderSaving&&$('fan-cards').children[index]!==el)$('fan-cards').insertBefore(el,$('fan-cards').children[index]||null);
-    if((cardSignatures.get(f.id)?.fan!==signature||cardSignatures.get(f.id)?.common!==commonSignature)&&!editingRanges.has(f.id)&&!fanDrag){
-      cardSignatures.set(f.id,{fan:signature,common:commonSignature});
+    if((cardSignatures.get(f.id)?.config!==configSignature||cardSignatures.get(f.id)?.fan!==signature||cardSignatures.get(f.id)?.common!==commonSignature)&&!editingRanges.has(f.id)&&!fanDrag){
+      cardSignatures.set(f.id,{config:configSignature,fan:signature,common:commonSignature});
       el.innerHTML=`<div class="card-top"><button class="fan-symbol fan-drag-handle" data-drag-handle aria-label="拖动 ${esc(f.name)} 排序；Alt 加方向键调整顺序" title="拖动排序 · Alt + 方向键" ${disabled||orderSaving?'disabled':''}>${icon('fan')}</button><div class="card-name"><h3>${esc(f.name)}</h3><div class="chip-label">${esc(c?`${c.chip} · ${c.name}`:f.channel_id?'已绑定通道离线':'离线配置')}</div></div><label class="control-toggle status-control"><span class="status-tag" data-live="status"></span><input type="checkbox" data-toggle aria-label="${esc(f.name)} 启用控制" title="启用控制" ${requested?'checked':''} ${disabled||!state.control_allowed||(!requested&&(!f.identified||!c?.writable))?'disabled':''}></label></div>
         <div class="fan-values"><div class="output-reading"><strong data-live="actual">—</strong><small>% 输出</small></div><div class="reading"><span data-live="rpm">—</span> RPM<br><span data-live="temperature">—</span> °C 输入</div></div><div class="progress" role="img"><i data-live="progress"></i><span data-output-target hidden></span></div>
         <div class="card-controls"><div class="mode-buttons" role="group" aria-label="${esc(f.name)} 控制方式"><label class="mode-control curve-mode-control ${f.mode==='curve'?'selected':''}" title="曲线模式 · 选择曲线"><select data-field="curve_id" aria-label="${esc(f.name)} 曲线模式与曲线选择" ${disabled?'disabled':''}>${curveOptions(f)}</select></label><button class="mode-choice ${f.mode==='manual'?'selected':''}" data-mode="manual" aria-pressed="${f.mode==='manual'}" ${disabled?'disabled':''}>手动</button></div><label class="mode-control source-mode-control" title="温度源">${icon('activity')}<select data-field="source" aria-label="${esc(f.name)} 温度源" ${disabled?'disabled':''}>${sourceOptions(f)}</select></label></div>
         <div class="manual-field" ${f.mode==='manual'?'':'hidden'}><div class="slider-label"><label for="manual-${esc(f.id)}">手动输出</label><output data-live="manual">${fmt(Math.max(low,Math.min(high,f.manual_duty)))}%</output></div><input id="manual-${esc(f.id)}" data-manual type="range" min="${low}" max="${high}" step="1" value="${Math.max(low,Math.min(high,f.manual_duty))}" aria-label="${esc(f.name)} 手动输出" ${disabled?'disabled':''}><div class="hint">${fmt(low)}–${fmt(high)}% · 手动输出，曲线未使用</div></div>
         <button class="fan-curve-preview" data-edit-curve aria-label="编辑 ${esc(f.name)} 的曲线" ${disabled?'disabled':''}>${miniCurve(pointsFor(f),true)}</button>
         <div class="card-footer"><span class="hint" data-live="policy"></span><div class="toolbar">${!f.identified&&c?`<button class="text-button" data-identify="${esc(c.id)}" ${disabled?'disabled':''}>确认设备</button>`:`<button class="text-button" data-edit-curve ${disabled?'disabled':''}>编辑曲线</button>`}<button class="text-button" data-device ${disabled?'disabled':''}>${icon('settings')}设置</button></div></div><p class="card-feedback" data-live="feedback" role="status"></p>`;
+      el._live=Object.fromEntries([...el.querySelectorAll('[data-live]')].map(node=>[node.dataset.live,node]));
+      el._curve=el.querySelector('.fan-curve-preview>svg');
     }
-    const live=(key,value)=>{const target=el.querySelector(`[data-live="${key}"]`);if(target)text(target,value);};
+    if(!cardVisibility.visible(el,ids.size>16)&&!el.contains(document.activeElement))continue;
+    const live=(key,value)=>{const target=el._live[key];if(target)text(target,value);};
     const status=!connected?'连接中断':testing?'测试辨认中':state.pending_autostart?.[f.id]?'等待设备就绪':o.active?(o.fault?'保护运行':o.automatic?'显卡自动调速':'正在控制'):!f.identified?'待确认设备':c?'未启用控制':f.channel_id?'通道离线':'离线配置';
-    el.classList.toggle('is-active',connected&&!!o.active);el.classList.toggle('has-fault',connected&&!!o.active&&!!o.fault);live('status',status);attribute(el.querySelector('[data-live="status"]'),'class',`status-tag ${connected&&o.active?'active':''} ${connected&&o.fault&&o.active?'fault':''}`);
+    el.classList.toggle('is-active',connected&&!!o.active);el.classList.toggle('has-fault',connected&&!!o.active&&!!o.fault);live('status',status);attribute(el._live.status,'class',`status-tag ${connected&&o.active?'active':''} ${connected&&o.fault&&o.active?'fault':''}`);
     live('actual',connected?fmt(o.actual,1):'—');live('rpm',connected?fmt(o.rpm):'—');live('temperature',connected?fmt(o.temperature,1):'—');
-    updateMiniCurve(el.querySelector('.fan-curve-preview>svg'),pointsFor(f),connected?o.temperature:null,f.mode);
-    updateOutputBar(el.querySelector('.progress'),connected?o:{});
+    updateMiniCurve(el._curve,pointsFor(f),connected?o.temperature:null,f.mode);
+    updateOutputBar(el._live.progress.parentElement,connected?o:{});
     live('policy',o.active&&o.automatic?'曲线 0% · 显卡自动调速':requested?(state.background_service?'已保存 · 开机恢复':'本次运行有效'):c?.backend==='nvidia'?(c.mode===0?'显卡自动调速':'显卡原手动模式'):'保持原硬件控制');
     const message=cardMessages.get(f.id);const fault=connected&&o.active?o.fault:null;
     live('feedback',!connected?'读数已过期':pendingFans.has(f.id)?'正在应用…':fault||state.pending_autostart?.[f.id]||(o.active&&o.automatic?'由显卡决定转速与停转；曲线升高后自动接管':message?.text)||(o.active&&Math.abs((o.requested??o.target)-o.target)>1?'正在平滑调整':''));
-    el.querySelector('[data-live="feedback"]').classList.toggle('error',!!fault||!!message?.error);
+    el._live.feedback.classList.toggle('error',!!fault||!!message?.error);
   }
   if(!ids.size)$('fan-cards').innerHTML='<div class="empty">还没有风扇配置。<br><button class="button secondary" data-tab="devices">前往设备设置</button></div>';
 }
+// Keep the searchable names and native actions for every curve, but only retain
+// SVG nodes near the viewport. Fixed preview height keeps scrolling stable.
+const libraryObserver=typeof IntersectionObserver==='function'?new IntersectionObserver(entries=>{
+  for(const {target,isIntersecting} of entries){
+    if(!target.isConnected)continue;
+    if(isIntersecting){if(!target.firstChild)target.innerHTML=miniCurve(target._points);}
+    else if(target.firstChild)target.replaceChildren();
+  }
+},{rootMargin:'240px'}):null;
 function renderLibrary(){
   // Polls retain the immutable configuration snapshot until its revision changes.
   const available=editable();
   if(libraryConfig===state.config&&libraryEditable===available)return;
   libraryConfig=state.config;libraryEditable=available;
   const signature=JSON.stringify([state.config.curves,state.config.fans.map(f=>[f.curve_id,f.name]),editable()]);if(signature===librarySignature)return;librarySignature=signature;
-  $('curve-library').innerHTML=(state.config.curves||[]).map(c=>{const users=state.config.fans.filter(f=>f.curve_id===c.id);return `<article class="curve-card"><h3>${esc(c.name)}</h3>${miniCurve(c.points)}<p>${users.length?`用于 ${esc(users.map(f=>f.name).join('、'))}`:'尚未分配给风扇'} · ${c.points.length} 个节点</p><div class="toolbar"><button class="text-button" data-library-edit="${esc(c.id)}" ${!editable()?'disabled':''}>编辑</button><button class="text-button" data-library-copy="${esc(c.id)}" ${!editable()?'disabled':''}>复制</button><button class="text-button danger" data-library-delete="${esc(c.id)}" ${!editable()||users.length?'disabled':''} title="${users.length?'请先更换引用此曲线的风扇所用曲线':'删除未使用的曲线'}">删除</button></div></article>`;}).join('')||`<div class="empty curve-empty"><span class="empty-icon">${icon('curve')}</span><div><h3>从一条好曲线开始</h3><p>新建共享曲线，或将风扇的独立曲线保存到这里。</p></div><button class="button secondary" data-create-curve ${!editable()?'disabled':''}>${icon('plus')}创建第一条曲线</button></div>`;
+  libraryObserver?.disconnect();
+  $('curve-library').innerHTML=(state.config.curves||[]).map(c=>{const users=state.config.fans.filter(f=>f.curve_id===c.id);return `<article class="curve-card"><h3>${esc(c.name)}</h3><div class="library-curve-preview" data-library-preview="${esc(c.id)}" role="img" aria-label="${esc(c.points.map(([t,d])=>`${t}°C ${d}%`).join('，'))}"></div><p>${users.length?`用于 ${esc(users.map(f=>f.name).join('、'))}`:'尚未分配给风扇'} · ${c.points.length} 个节点</p><div class="toolbar"><button class="text-button" data-library-edit="${esc(c.id)}" ${!editable()?'disabled':''}>编辑</button><button class="text-button" data-library-copy="${esc(c.id)}" ${!editable()?'disabled':''}>复制</button><button class="text-button danger" data-library-delete="${esc(c.id)}" ${!editable()||users.length?'disabled':''} title="${users.length?'请先更换引用此曲线的风扇所用曲线':'删除未使用的曲线'}">删除</button></div></article>`;}).join('')||`<div class="empty curve-empty"><span class="empty-icon">${icon('curve')}</span><div><h3>从一条好曲线开始</h3><p>新建共享曲线，或将风扇的独立曲线保存到这里。</p></div><button class="button secondary" data-create-curve ${!editable()?'disabled':''}>${icon('plus')}创建第一条曲线</button></div>`;
+  for(const preview of $('curve-library').querySelectorAll('[data-library-preview]')){
+    preview._points=findCurve(preview.dataset.libraryPreview).points;
+    if(libraryObserver)libraryObserver.observe(preview);else preview.innerHTML=miniCurve(preview._points);
+  }
 }
 function renderDiscovery(){
   const devices=state.discovery||[];const pending=devices.filter(c=>c.connection==='unconfirmed'&&!c.identified);
@@ -164,7 +221,21 @@ function renderDiscovery(){
   }
   for(const el of document.querySelectorAll('[data-channel]')){const c=devices.find(c=>c.id===el.dataset.channel);el.querySelector('[data-rpm]').textContent=`${connected?fmt(c?.rpm):'—'} RPM`;el.querySelector('[data-duty]').textContent=`${connected?fmt(c?.duty,1):'—'}% 硬件输出`;}
 }
-function renderSensors(){html($('sensor-table'),[...state.sensors.map(s=>`<tr><td>${esc(s.name)}</td><td>${esc(s.chip)}</td><td>${s.kind==='cpu'?'CPU':s.kind==='gpu'?'GPU':'温度'}</td><td>${connected?fmt(s.value,1):'—'} °C</td></tr>`),...state.fans.map(f=>`<tr><td>${esc(f.name)}</td><td>${esc(f.chip)}</td><td>转速</td><td>${connected?fmt(f.rpm):'—'} RPM</td></tr>`)].join(''));}
+function renderSensors(){
+  const table=$('sensor-table'),rows=new Map([...table.children].map(row=>[row._key,row]));
+  let index=0;
+  for(const [kind,items] of [['temperature',state.sensors],['rpm',state.fans]])for(const item of items){
+    const key=`${kind}/${item.id}`;let row=rows.get(key);rows.delete(key);
+    if(!row){row=document.createElement('tr');row._key=key;for(let i=0;i<4;i++)row.append(document.createElement('td'));}
+    const cells=row.children;
+    text(cells[0],item.name);text(cells[1],item.chip);
+    text(cells[2],kind==='rpm'?'转速':item.kind==='cpu'?'CPU':item.kind==='gpu'?'GPU':'温度');
+    text(cells[3],kind==='rpm'?`${connected?fmt(item.rpm):'—'} RPM`:`${connected?fmt(item.value,1):'—'} °C`);
+    if(table.children[index]!==row)table.insertBefore(row,table.children[index]||null);
+    index++;
+  }
+  for(const row of rows.values())row.remove();
+}
 function renderDiagnostics(){const row=(name,value)=>`<div class="diagnostic-row"><span>${esc(name)}</span><span>${esc(value)}</span></div>`;html($('diagnostics-content'),`<article class="panel diagnostic-card"><h3>本机服务</h3>${row('运行方式',state.background_service?'systemd 后台服务':'临时前台')}${row('硬件写入',state.control_allowed?'已允许':'仅监控')}${row('GPU 温度',state.gpu_error||'正常')}${row('NVIDIA 风扇接口',state.gpu_control_error||'正常')}${row('配置格式',`v${state.config.version}`)}${row('配置文件',state.demo?'data/config.demo.json':'data/config.json')}<p class="hint">首次升级保存前自动备份旧配置。更新代码后需重启服务；关闭网页不会停止后台调速。</p></article><article class="panel diagnostic-card"><h3>风扇控制通道</h3>${state.channels.map(c=>row(`${c.chip} · ${c.name}`,c.reason||`${fmt(c.duty,1)}% · ${c.watchdog?'硬件看门狗':c.software_watchdog?'独立进程守护':'无硬件看门狗'}`)).join('')||'<p class="hint">未检测到可用通道</p>'}</article><article class="panel diagnostic-card"><h3>维护</h3><p class="hint">查看状态：<code>systemctl status fancontrollx</code><br>更新后重启：<code>sudo systemctl restart fancontrollx</code><br>查看日志：<code>sudo journalctl -u fancontrollx -n 50 --no-pager</code></p></article>`);html($('event-list'),state.events.map(e=>`<div class="event-row"><time>${formatTime(e.time)}</time><span>${esc(e.message)}</span></div>`).join('')||'<p class="hint">暂无运行事件</p>');}
 function rememberCardFocus(id){
   const focused=document.activeElement,card=focused.closest('[data-fan]');
