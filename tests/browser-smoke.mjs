@@ -78,6 +78,20 @@ try{
   assert.equal(await evaluate(`document.querySelectorAll('[data-fan] button,[data-fan] a,[data-fan] [tabindex],[data-fan] [draggable]').length`),0,'Viewer fan cards have no editing or drag controls');
   assert.equal(await evaluate(`(async()=>{const view=await(await fetch('/api/view')).json();return view.fans.every(f=>{const svg=Array.from(document.querySelectorAll('[data-fan]')).find(c=>c.dataset.fan===f.id).querySelector('.fan-curve-preview>svg');return svg.querySelectorAll(':scope>circle').length===f.points.filter(p=>p[0]>=20&&p[0]<=100).length&&svg.querySelector('[data-curve-current]').getAttribute('visibility')===(Number.isFinite(f.output?.temperature)?'visible':'hidden')})})()`),true,'Viewer curves show configured nodes and available temperature markers');
   assert.equal(await evaluate(`['cpu','gpu'].every(kind=>document.querySelector('#'+kind+'-spark path')?.getAttribute('d').includes('M'))`),true,'Viewer displays cached CPU and GPU temperature history');
+  assert.equal(await evaluate(`(async()=>{
+    const {text,updateOutputBar}=await import('/ui.js');
+    const span=document.createElement('span');text(span,'40');const node=span.firstChild;
+    text(span,'50');if(span.firstChild!==node||node.nodeValue!=='50')return false;
+    text(span,'');text(span,'60');if(span.firstChild!==node||node.nodeValue!=='60')return false;
+    span.innerHTML='<b>old markup</b>';text(span,'safe <text>');
+    if(span.childNodes.length!==1||span.firstChild.nodeType!==Node.TEXT_NODE)return false;
+    const bar=document.createElement('div');bar.innerHTML='<i></i><span data-output-target hidden></span>';
+    const output={actual:50,requested:60};updateOutputBar(bar,output);
+    const observer=new MutationObserver(()=>{});observer.observe(bar,{subtree:true,attributes:true,childList:true});
+    updateOutputBar(bar,output);const changes=observer.takeRecords();observer.disconnect();
+    updateOutputBar(bar,{...output,automatic:true});if(!bar.lastChild.hidden)return false;
+    updateOutputBar(bar,output);return changes.length===0&&!bar.lastChild.hidden;
+  })()`),true,'Live text retains text nodes and stable bars perform no DOM writes');
   const chooseColumns=columns=>evaluate(`(()=>{const select=document.getElementById('fan-columns');select.value=${JSON.stringify(columns)};select.dispatchEvent(new Event('change'))})()`);
   const renderedColumns=()=>evaluate(`getComputedStyle(document.getElementById('fan-cards')).gridTemplateColumns.split(' ').length`);
   for(const columns of ['1','2','3','4']){
@@ -125,6 +139,17 @@ try{
   await waitFor(`document.querySelector('[data-output-target]').hidden && document.querySelector('[data-curve-current]').getAttribute('visibility')==='visible'`);
   await evaluate(`window.mockViewerState.fans[0].output.temperature=null;document.getElementById('retry').click()`);
   await waitFor(`document.querySelector('[data-curve-current]').getAttribute('visibility')==='hidden'`);
+  await evaluate(`window.smallViewerFans=window.mockViewerState.fans;window.mockViewerState.fans=Array.from({length:24},(_,i)=>({...structuredClone(window.smallViewerFans[0]),id:'visible-'+i,name:'Fan '+i,output:{...window.smallViewerFans[0].output,actual:66}}));document.getElementById('retry').click()`);
+  await waitFor(`document.querySelectorAll('[data-fan]').length===24`);
+  // Allow viewport observation, then change an offscreen card's state.
+  await new Promise(resolve=>setTimeout(resolve,200));
+  await evaluate(`window.mockViewerState.fans.forEach(f=>f.output.actual=77);document.getElementById('retry').click()`);
+  await waitFor(`document.querySelector('[data-live="actual"]').textContent==='77'`);
+  assert.equal(await evaluate(`document.querySelector('[data-fan="visible-23"] [data-live="actual"]').textContent`),'66','Large workspaces defer offscreen telemetry DOM updates');
+  await evaluate(`document.querySelector('[data-fan="visible-23"]').scrollIntoView({block:'center'})`);
+  await waitFor(`document.querySelector('[data-fan="visible-23"] [data-live="actual"]').textContent==='77'`);
+  await evaluate(`window.mockViewerState.fans=window.smallViewerFans;window.scrollTo(0,0);document.getElementById('retry').click()`);
+  await waitFor(`document.querySelectorAll('[data-fan]').length===window.smallViewerFans.length`);
   await evaluate(`window.fetch=()=>Promise.reject(new Error('simulated disconnect'));document.getElementById('retry').click()`);
   await waitFor(`!document.getElementById('connection-error').hidden`);
   assert.equal(await evaluate(`Array.from(document.querySelectorAll('[data-curve-current]')).every(m=>m.getAttribute('visibility')==='hidden')`),true,'Disconnected viewer hides all current markers');
@@ -142,6 +167,11 @@ try{
   await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
   await send('Page.navigate',{url:new URL('/edit',url).href});
   await waitFor('document.getElementById("connection-text")?.textContent.includes("已连接") && document.querySelector("#curve-dialog")');
+  assert.equal(await evaluate(`document.getElementById('view-link').getAttribute('href')`),'/view','Editor has an explicit viewer button');
+  await evaluate(`document.getElementById('view-link').click()`);
+  await waitFor(`location.pathname==='/view'&&document.getElementById('edit-link')&&document.getElementById('connection-text')?.textContent.includes('已连接')`);
+  await evaluate(`document.getElementById('edit-link').click()`);
+  await waitFor(`location.pathname==='/edit'&&document.getElementById('view-link')&&document.getElementById('connection-text')?.textContent.includes('已连接')`);
   assert.equal(await evaluate(`document.getElementById('fan-columns').value`),'4','Editor shares the viewer column preference');
   for(const columns of ['1','2','3','4']){
     await chooseColumns(columns);
@@ -175,6 +205,35 @@ try{
     const first=config.fans[0].id,second=config.fans[1].id;
     const card=id=>`document.querySelector('[data-fan="${id}"]')`;
     const post=async(path,body)=>evaluate(`(async()=>{const s=await(await fetch('/api/state')).json();const r=await fetch(${JSON.stringify(path)},{method:'POST',headers:{'Content-Type':'application/json','X-FanControl-Token':s.csrf_token},body:JSON.stringify(${JSON.stringify(body)})});if(!r.ok)throw new Error(await r.text());return r.json()})()`);
+    const largeLibrary=Array.from({length:20},(_,i)=>({id:`lazy-${i}`,name:`曲线 ${i}`,points:[[30,20],[80,100]]}));
+    await post('/api/config',{...config,curves:largeLibrary});
+    await evaluate(`document.getElementById('retry').click()`);
+    await waitFor(`document.querySelectorAll('.curve-card').length===20`);
+    await waitFor(`document.querySelectorAll('.library-curve-preview svg').length<20`);
+    await evaluate(`document.querySelector('.curve-card:last-child').scrollIntoView({block:'center'})`);
+    await waitFor(`document.querySelector('.curve-card:last-child .library-curve-preview svg')!==null`);
+    const previewHeight=await evaluate(`document.querySelector('.library-curve-preview').getBoundingClientRect().height`);
+    await evaluate(`window.scrollTo(0,0)`);
+    await waitFor(`document.querySelector('.curve-card:last-child .library-curve-preview svg')===null`);
+    assert.equal(await evaluate(`document.querySelector('.library-curve-preview').getBoundingClientRect().height`),previewHeight,'Releasing offscreen curve nodes preserves layout');
+    const menu=`${card(first)}.querySelector('[data-field="curve_id"]')`;
+    assert.equal(await evaluate(`${menu}.options.length`),1,'Large curve menus retain only the selected option while idle');
+    await evaluate(`${menu}.focus()`);
+    assert.equal(await evaluate(`${menu}.options.length`),21,'Keyboard focus populates the complete native curve menu');
+    await evaluate(`${menu}.value='lazy-19';${menu}.dispatchEvent(new Event('change',{bubbles:true}))`);
+    await waitFor(`(async()=> (await(await fetch('/api/state')).json()).config.fans[0].curve_id==='lazy-19')()`);
+    await waitFor(`${menu}.disabled===false`);
+    await evaluate(`document.getElementById('new-curve').focus()`);
+    assert.deepEqual(await evaluate(`[${menu}.options.length,${menu}.value,${menu}.selectedOptions[0].textContent]`),[1,'lazy-19','曲线 19'],'Blur releases unused options and preserves the selected curve');
+    await evaluate(`${menu}.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true}))`);
+    assert.equal(await evaluate(`${menu}.options.length`),21,'Pointer interaction populates the full menu before opening');
+    await post('/api/config',config);
+    await evaluate(`document.getElementById('retry').click()`);
+    await waitFor(`document.querySelectorAll('.curve-card').length===0 && ${menu}.value===''`);
+    await evaluate(`document.querySelector('[data-tab="sensors"]').click();window.sensorRow=document.querySelector('#sensor-table tr');window.sensorValue=window.sensorRow.lastChild.firstChild;window.sensorFetch=window.fetch;window.sensorPolled=false;window.fetch=async(...args)=>{const r=await window.sensorFetch(...args);if(!String(args[0]).startsWith('/api/state'))return r;const s=await r.json();s.sensors[0].value=63.4;window.sensorPolled=true;return new Response(JSON.stringify(s));};document.getElementById('retry').click()`);
+    await waitFor(`window.sensorPolled&&document.querySelector('#sensor-table tr:last-of-type')&&window.sensorRow.lastChild.textContent==='63.4 °C'`);
+    assert.equal(await evaluate(`window.sensorRow===document.querySelector('#sensor-table tr')&&window.sensorValue===window.sensorRow.lastChild.firstChild`),true,'Sensor telemetry reuses rows and text nodes');
+    await evaluate(`window.fetch=window.sensorFetch;document.querySelector('[data-tab="control"]').click()`);
     const drag=await evaluate(`(()=>{const a=${card(first)}.querySelector('[data-drag-handle]').getBoundingClientRect(),b=${card(second)}.getBoundingClientRect();return{from:{x:a.x+a.width/2,y:a.y+a.height/2},to:{x:b.x+b.width/2,y:b.y+b.height/2}}})()`);
     await send('Input.dispatchMouseEvent',{type:'mousePressed',...drag.from,button:'left',clickCount:1});
     await send('Input.dispatchMouseEvent',{type:'mouseMoved',...drag.to,buttons:1});
@@ -480,6 +539,7 @@ try{
       await evaluate(`document.querySelector('nav [data-tab="${name}"]').click()`);
       assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'),true,`${name} overflow at ${width}px`);
       assert.equal(await evaluate(`document.querySelector('nav [aria-current="page"]').dataset.tab`),name);
+      assert.equal(await evaluate(`(()=>{const r=document.getElementById('view-link').getBoundingClientRect();return r.width>0&&r.left>=0&&r.right<=innerWidth})()`),true,`Viewer button is visible at ${width}px`);
     }
   }
   await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
