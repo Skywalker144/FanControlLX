@@ -4,8 +4,8 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, VecDeque},
-    io::{BufReader, Read, Write},
+    collections::VecDeque,
+    io::{BufRead, BufReader, Read, Write},
     net::{IpAddr, TcpListener, TcpStream},
     sync::{mpsc, Arc, Mutex, OnceLock},
     time::Duration,
@@ -170,47 +170,73 @@ fn reply_headers(
     s.write_all(&header)?;
     s.write_all(body)
 }
+
+// Read bounded chunks, preserving buffered body bytes. A worker reuses its
+// header storage; header names and values borrow it for this request only.
+fn read_headers(reader: &mut impl BufRead, raw: &mut Vec<u8>) -> Result<()> {
+    const LIMIT: usize = 16384;
+    raw.clear();
+    while !raw.ends_with(b"\r\n\r\n") {
+        let count = reader
+            .take((LIMIT + 1 - raw.len()) as u64)
+            .read_until(b'\n', raw)?;
+        if raw.len() > LIMIT {
+            return Err(Error(413, "请求头过大".into()));
+        }
+        if count == 0 {
+            return Err(invalid("请求头不完整"));
+        }
+    }
+    Ok(())
+}
+struct Headers<'a>(Vec<(&'a str, &'a str)>);
+impl<'a> Headers<'a> {
+    fn parse(lines: impl Iterator<Item = &'a str>) -> Result<Self> {
+        let mut headers = Self(Vec::with_capacity(16));
+        for line in lines.filter(|s| !s.is_empty()) {
+            let (key, value) = line.split_once(':').ok_or_else(|| invalid("无效请求头"))?;
+            if headers.get(key).is_some() {
+                return Err(invalid("请求头重复"));
+            }
+            headers.0.push((key, value.trim()));
+        }
+        Ok(headers)
+    }
+    fn get(&self, key: &str) -> Option<&'a str> {
+        self.0
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| *v)
+    }
+}
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query
+        .split('&')
+        .filter_map(|p| p.split_once('='))
+        .filter(|(k, _)| *k == key)
+        .map(|(_, v)| v)
+        .next_back()
+}
 fn handle(
     s: &mut TcpStream,
     engine: &Client,
     cache: &Mutex<ResponseCache>,
     token: &str,
     hostname: &str,
+    raw: &mut Vec<u8>,
 ) -> Result<()> {
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
     s.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let mut reader = BufReader::new(&mut *s);
-    let mut raw = vec![];
-    // Limit bytes, not just line count; a slow/oversized client cannot allocate
-    // arbitrary memory or enqueue a control command before its body is ready.
-    loop {
-        let mut byte = [0];
-        reader.read_exact(&mut byte)?;
-        raw.push(byte[0]);
-        if raw.ends_with(b"\r\n\r\n") {
-            break;
-        }
-        if raw.len() > 16384 {
-            return Err(Error(413, "请求头过大".into()));
-        }
-    }
-    let header = std::str::from_utf8(&raw).map_err(|_| invalid("请求头编码无效"))?;
+    let mut reader = BufReader::with_capacity(1024, &mut *s);
+    read_headers(&mut reader, raw)?;
+    let header = std::str::from_utf8(raw).map_err(|_| invalid("请求头编码无效"))?;
     let mut lines = header.split("\r\n");
     let parts: Vec<_> = lines.next().unwrap_or("").split_whitespace().collect();
     if parts.len() != 3 || !["HTTP/1.0", "HTTP/1.1"].contains(&parts[2]) {
         return Err(invalid("无效 HTTP 请求"));
     }
-    let mut headers = HashMap::new();
-    for line in lines.filter(|s| !s.is_empty()) {
-        let (k, v) = line.split_once(':').ok_or_else(|| invalid("无效请求头"))?;
-        if headers
-            .insert(k.to_ascii_lowercase(), v.trim().to_owned())
-            .is_some()
-        {
-            return Err(invalid("请求头重复"));
-        }
-    }
-    let host = headers.get("host").map(String::as_str).unwrap_or("");
+    let headers = Headers::parse(lines)?;
+    let host = headers.get("host").unwrap_or("");
     if !allowed_host(host) {
         return Err(Error(403, "仅允许通过 localhost 或回环地址访问".into()));
     }
@@ -240,23 +266,16 @@ fn handle(
             return Ok(());
         }
         let operation = match path {
-            "/api/view" => {
-                let params: HashMap<_, _> =
-                    query.split('&').filter_map(|p| p.split_once('=')).collect();
-                Operation::View {
-                    since: params.get("since").map(|s| (*s).to_owned()),
-                    after: params.get("after").and_then(|s| s.parse().ok()),
-                }
-            }
+            "/api/view" => Operation::View {
+                since: query_param(query, "since").map(str::to_owned),
+                after: query_param(query, "after").and_then(|s| s.parse().ok()),
+            },
             "/api/state" => {
-                let params: HashMap<_, _> =
-                    query.split('&').filter_map(|p| p.split_once('=')).collect();
-                let after = params
-                    .get("after")
+                let after = query_param(query, "after")
                     .and_then(|s| s.parse::<f64>().ok())
                     .filter(|v| v.is_finite() && *v >= 0. && *v <= wall());
                 Operation::State {
-                    since: params.get("since").map(|s| (*s).to_owned()),
+                    since: query_param(query, "since").map(str::to_owned),
                     after,
                 }
             }
@@ -294,14 +313,11 @@ fn handle(
     }
     if headers
         .get("origin")
-        .is_some_and(|o| o != &format!("http://{host}"))
+        .is_some_and(|o| o != format!("http://{host}"))
     {
         return Err(Error(403, "不允许跨站请求".into()));
     }
-    let provided = headers
-        .get("x-fancontrol-token")
-        .map(String::as_str)
-        .unwrap_or("");
+    let provided = headers.get("x-fancontrol-token").unwrap_or("");
     let mismatch = provided.len() != token.len()
         || provided
             .bytes()
@@ -311,7 +327,7 @@ fn handle(
     if mismatch {
         return Err(Error(403, "页面会话已过期，请刷新后重试".into()));
     }
-    if headers.contains_key("transfer-encoding")
+    if headers.get("transfer-encoding").is_some()
         || headers
             .get("content-type")
             .is_none_or(|s| s.split(';').next().unwrap_or("").trim() != "application/json")
@@ -358,30 +374,33 @@ pub fn start(listener: TcpListener, engine: Client) -> Result<()> {
             hostname.clone(),
             cache.clone(),
         );
-        std::thread::spawn(move || loop {
-            let socket = rx.lock().unwrap().recv();
-            let Ok(mut socket) = socket else {
-                break;
-            };
-            if let Err(e) = handle(&mut socket, &e, &cache, &t, &h) {
-                let _ = reply(
-                    &mut socket,
-                    e.0,
-                    json!({"error":e.1}).to_string().as_bytes(),
-                    "application/json; charset=utf-8",
-                );
-                // Send the complete rejection before closing an unread POST.
-                // Closing with queued request bytes would send RST and can
-                // truncate the response seen by the browser.
-                let _ = socket.shutdown(std::net::Shutdown::Write);
-                let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
-                let deadline = std::time::Instant::now() + Duration::from_millis(200);
-                let mut remaining = 256 * 1024;
-                let mut buf = [0; 4096];
-                while remaining > 0 && std::time::Instant::now() < deadline {
-                    match socket.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => remaining -= n.min(remaining),
+        std::thread::spawn(move || {
+            let mut raw = Vec::with_capacity(1024);
+            loop {
+                let socket = rx.lock().unwrap().recv();
+                let Ok(mut socket) = socket else {
+                    break;
+                };
+                if let Err(e) = handle(&mut socket, &e, &cache, &t, &h, &mut raw) {
+                    let _ = reply(
+                        &mut socket,
+                        e.0,
+                        json!({"error":e.1}).to_string().as_bytes(),
+                        "application/json; charset=utf-8",
+                    );
+                    // Send the complete rejection before closing an unread POST.
+                    // Closing with queued request bytes would send RST and can
+                    // truncate the response seen by the browser.
+                    let _ = socket.shutdown(std::net::Shutdown::Write);
+                    let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
+                    let deadline = std::time::Instant::now() + Duration::from_millis(200);
+                    let mut remaining = 256 * 1024;
+                    let mut buf = [0; 4096];
+                    while remaining > 0 && std::time::Instant::now() < deadline {
+                        match socket.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => remaining -= n.min(remaining),
+                        }
                     }
                 }
             }
@@ -405,6 +424,35 @@ pub fn start(listener: TcpListener, engine: Client) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn header_chunks_preserve_body_and_reject_oversize_or_partial_requests() {
+        let request =
+            b"POST /api/config HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}";
+        let mut raw = Vec::new();
+        for capacity in [1, 2, 7, 1024] {
+            let mut reader = BufReader::with_capacity(capacity, request.as_slice());
+            read_headers(&mut reader, &mut raw).unwrap();
+            assert_eq!(raw, &request[..request.len() - 2]);
+            let mut body = String::new();
+            reader.read_to_string(&mut body).unwrap();
+            assert_eq!(body, "{}");
+        }
+        let mut oversized = std::io::Cursor::new(vec![b'x'; 16385]);
+        assert_eq!(read_headers(&mut oversized, &mut raw).unwrap_err().0, 413);
+        let mut partial = std::io::Cursor::new(b"GET / HTTP/1.1\r\nHost: localhost\r\n");
+        assert_eq!(read_headers(&mut partial, &mut raw).unwrap_err().0, 400);
+        assert!(Headers::parse(["Host: localhost", "hOsT: evil"].into_iter()).is_err());
+        let headers =
+            Headers::parse(["HOST: localhost", "Content-Type: application/json"].into_iter())
+                .unwrap();
+        assert_eq!(headers.get("host"), Some("localhost"));
+        assert_eq!(headers.get("content-type"), Some("application/json"));
+        assert_eq!(
+            query_param("after=1&since=revision&after=2", "after"),
+            Some("2")
+        );
+    }
+
     #[test]
     fn host_validation() {
         for h in ["localhost:8090", "127.0.0.1:8090", "[::1]:8090"] {
