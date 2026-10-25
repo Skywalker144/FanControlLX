@@ -8,7 +8,7 @@
 .view-card { min-width: 0; }
 .view-card h3 { margin: 0; overflow-wrap: anywhere; }
 .view-card .card-top { flex-wrap: wrap; }
-.view-card .fan-curve-preview { margin: 0; }
+.view-card .fan-curve-preview { margin-top: 0; }
 .view-fault { color: var(--danger) !important; overflow-wrap: anywhere; margin-top: 10px; margin-bottom: 0; }
 .viewer footer { gap: 12px; flex-wrap: wrap; }
 .viewer #version { display: inline; margin: 0; font-size: inherit; }
@@ -16,7 +16,6 @@
 @media (max-width: 600px) {
   .view-main { padding: 20px 16px; }
   .view-header { align-items: flex-start; flex-direction: column; gap: 12px; }
-  .view-card { padding: 20px; }
   .view-service { grid-column: 1 / -1; min-height: auto; }
   .view-service>strong { white-space: nowrap; }
 }
