@@ -1010,6 +1010,42 @@ fn smoothing_hysteresis_response_and_rate_limits_use_elapsed_time() {
     );
 }
 #[test]
+fn sliding_average_expires_missing_samples_and_resets_after_source_edits() {
+    let (mut f, mut s, mut m) = policy();
+    f["smoothing_s"] = json!(5);
+    let mut reference = std::collections::VecDeque::new();
+    // Include fractional readings, exact window boundaries, missing readings,
+    // long gaps and recovery; compare against direct summation.
+    for i in 0..1000 {
+        let now = i as f64 * 0.5;
+        let raw = (i % 41 < 25).then_some(30.1 + (i % 60) as f64 / 3.);
+        s.sensors[0]["value"] = json!(raw);
+        if let Some(raw) = raw {
+            reference.push_back((now, raw));
+        }
+        while reference.front().is_some_and(|p| p.0 < now - 5.) {
+            reference.pop_front();
+        }
+        let output = compute(&f, &json!([]), &s, &mut m, false, now);
+        if raw.is_some() {
+            let expected = reference.iter().map(|p| p.1).sum::<f64>() / reference.len() as f64;
+            assert!((num(&output["smoothed"]) - expected).abs() <= 0.051);
+        } else {
+            assert!(output["smoothed"].is_null());
+            assert_eq!(output["target"], 100.);
+        }
+    }
+    let (_temp, mut engine, _, id) = setup(false);
+    engine
+        .request(
+            "/api/fan",
+            &json!({"id":id,"changes":{"sensor_ids":["@gpu"]}}),
+        )
+        .unwrap();
+    let output = &engine.state(None, None)["outputs"][&id];
+    assert_eq!(output["smoothed"], output["temperature"]);
+}
+#[test]
 fn background_discovery_only_for_live_editors_or_missing_devices() {
     let mut d = crate::engine::Discovery::default();
     assert!(!d.due(600., false));
