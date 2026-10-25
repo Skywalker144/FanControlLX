@@ -42,7 +42,23 @@ bash -n install-service.sh webui.sh build.sh
 cargo test --release --locked benchmark_ -- --ignored --nocapture --test-threads=1
 ```
 
+额外测量 NVML 对象复用时，先编译模拟库；下列命令不访问真实显卡：
+
+```bash
+mock_dir=$(mktemp -d /tmp/fancontrollx-nvml-bench.XXXXXX)
+cc -shared -fPIC -Wall -Wextra -Werror tests/mock_nvml.c -o "$mock_dir/libnvidia-ml.so.1"
+LD_LIBRARY_PATH="$mock_dir" FANCONTROLLX_MOCK_DIR="$mock_dir" \
+  cargo test --release --locked benchmark_mock_nvml_sampling -- --ignored --nocapture
+rm -r -- "$mock_dir"
+```
+
 基准使用演示数据和临时 hwmon 文件，不访问真实硬件；只在测试构建中启用计数分配器。输出每轮分配次数、累计申请字节和耗时，不能把申请字节当成常驻内存。
+
+`benchmark_control_cycles` 另测 3/64 路配置下编辑/观看增量响应的构造开销，以及固定样本、每步 0.5 秒、60 秒平滑窗口的策略计算。策略基准不包含硬件 I/O，接口基准不包含网络和序列化。比较修改前后时保持同一基准代码、release 编译及相同运行环境。
+
+新增回归覆盖滑动总和在缺失读数、窗口边界和来源修改后的正确性，以及请求头分块读取、正文保留、大小限制、截断与大小写重复。浏览器回归覆盖编辑到观看页的实际导航、曲线库滚动时创建/释放 SVG 且高度不变、传感器读数改变时保留行和文本节点。
+
+索引回归覆盖设备重排、同数量设备替换、移除、温度分组变化和缺失成员。模拟 GPU 进程回归另外覆盖复用布局中的实时温度、模式、输出、RPM、读数失败与恢复，以及风扇数量变化和整卡消失/重连。浏览器回归验证文本节点复用、稳定输出条不写 DOM，以及大曲线库按焦点/指针展开和失焦收起后的保存行为。
 
 黑盒 GPU 测试需要 C 编译器，动态库只注入测试子进程。安装单元测试不会调用真实 systemctl、安装驱动或修改系统目录。
 
