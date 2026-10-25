@@ -2,6 +2,7 @@ use crate::{
     common::*,
     config,
     hardware::{Hardware, Snapshot},
+    telemetry::Inputs,
 };
 use serde_json::{json, Value};
 use std::{
@@ -15,25 +16,34 @@ use std::{
 #[derive(Default)]
 pub struct Memory {
     pub samples: VecDeque<(f64, f64)>,
+    sample_sum: f64,
     pub last: f64,
     pub changed: f64,
     pub temp: Option<f64>,
     pub duty: Option<f64>,
     pub active_since: Option<f64>,
 }
+#[cfg(test)]
 pub fn interpolate(points: &Value, t: f64) -> f64 {
-    let p = array(points);
-    if t <= num(&p[0][0]) {
-        return num(&p[0][1]);
+    interpolate_points(
+        &array(points)
+            .iter()
+            .map(|p| (num(&p[0]), num(&p[1])))
+            .collect::<Vec<_>>(),
+        t,
+    )
+}
+fn interpolate_points(points: &[(f64, f64)], t: f64) -> f64 {
+    if t <= points[0].0 {
+        return points[0].1;
     }
-    for pair in p.windows(2) {
-        let (a, b) = (&pair[0], &pair[1]);
-        if t <= num(&b[0]) {
-            return num(&a[1])
-                + (num(&b[1]) - num(&a[1])) * (t - num(&a[0])) / (num(&b[0]) - num(&a[0]));
+    for pair in points.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if t <= b.0 {
+            return a.1 + (b.1 - a.1) * (t - a.0) / (b.0 - a.0);
         }
     }
-    num(&p.last().unwrap()[1])
+    points.last().unwrap().1
 }
 // Aggregate in place: safety checks use the maximum before smoothing, even
 // when the configured control aggregation is average or minimum.
@@ -86,7 +96,7 @@ pub fn source_values(ids: &Value, sensors: &[Value]) -> Option<SourceValues> {
     (result.count > 0).then_some(result)
 }
 
-// Resolve numeric policy and shared curve positions only on configuration
+// Resolve numeric policy, curve points and source selections on configuration
 // changes. The original JSON stays available for persistence and the editor.
 struct Policy {
     smoothing_s: f64,
@@ -99,7 +109,14 @@ struct Policy {
     step_down: f64,
     step_up: f64,
     manual: bool,
-    curve: Option<usize>,
+    points: Vec<(f64, f64)>,
+    sources: Vec<String>,
+    aggregation: Aggregation,
+}
+enum Aggregation {
+    Maximum,
+    Minimum,
+    Average,
 }
 impl Policy {
     fn new(f: &Value, curves: &Value) -> Self {
@@ -114,8 +131,40 @@ impl Policy {
             step_down: num(&f["step_down"]),
             step_up: num(&f["step_up"]),
             manual: f["mode"] == "manual",
-            curve: array(curves).iter().position(|c| c["id"] == f["curve_id"]),
+            points: array(
+                array(curves)
+                    .iter()
+                    .find(|c| c["id"] == f["curve_id"])
+                    .map(|c| &c["points"])
+                    .unwrap_or(&f["points"]),
+            )
+            .iter()
+            .map(|p| (num(&p[0]), num(&p[1])))
+            .collect(),
+            sources: array(&f["sensor_ids"])
+                .iter()
+                .flat_map(|id| match text(id) {
+                    "@cpu-gpu" => vec!["@cpu".to_owned(), "@gpu".to_owned()],
+                    id => vec![id.to_owned()],
+                })
+                .collect(),
+            aggregation: match text(&f["aggregation"]) {
+                "average" => Aggregation::Average,
+                "min" => Aggregation::Minimum,
+                _ => Aggregation::Maximum,
+            },
         }
+    }
+    fn values(&self, s: &Snapshot, inputs: &Inputs) -> Option<SourceValues> {
+        let mut result = SourceValues::default();
+        for id in &self.sources {
+            result.push(match id.as_str() {
+                "@cpu" => inputs.cpu,
+                "@gpu" => inputs.gpu,
+                _ => inputs.temperature(s, id),
+            }?);
+        }
+        (result.count > 0).then_some(result)
     }
     fn all(config: &Value) -> Vec<Self> {
         array(&config["fans"])
@@ -156,39 +205,45 @@ pub fn compute(
     active: bool,
     now: f64,
 ) -> Value {
-    calculate(f, curves, &Policy::new(f, curves), s, m, active, now).value()
+    let mut inputs = Inputs::default();
+    inputs.refresh(s);
+    calculate(f, &Policy::new(f, curves), s, &inputs, m, active, now).value()
 }
 fn calculate(
     f: &Value,
-    curves: &Value,
     policy: &Policy,
     s: &Snapshot,
+    inputs: &Inputs,
     m: &mut Memory,
     active: bool,
     now: f64,
 ) -> Output {
-    let c = s.channels.iter().find(|c| c["id"] == f["channel_id"]);
-    let values = source_values(&f["sensor_ids"], &s.sensors);
-    let raw = values.as_ref().map(|v| match text(&f["aggregation"]) {
-        "average" => v.sum / v.count as f64,
-        "min" => v.min,
-        _ => v.max,
+    let c = inputs.channels.get(&s.channels, text(&f["channel_id"]));
+    let values = policy.values(s, inputs);
+    let raw = values.as_ref().map(|v| match policy.aggregation {
+        Aggregation::Average => v.sum / v.count as f64,
+        Aggregation::Minimum => v.min,
+        Aggregation::Maximum => v.max,
     });
-    if let Some(raw) = raw {
-        m.samples.push_back((now, raw));
-    }
     while m
         .samples
         .front()
         .is_some_and(|p| p.0 < now - policy.smoothing_s)
     {
-        m.samples.pop_front();
+        m.sample_sum -= m.samples.pop_front().unwrap().1;
+    }
+    if m.samples.is_empty() {
+        m.sample_sum = 0.;
+    }
+    if let Some(raw) = raw {
+        m.samples.push_back((now, raw));
+        m.sample_sum += raw;
     }
     let smoothed = raw.map(|raw| {
         if m.samples.is_empty() {
             raw
         } else {
-            m.samples.iter().map(|p| p.1).sum::<f64>() / m.samples.len() as f64
+            m.sample_sum / m.samples.len() as f64
         }
     });
     let mut fault: Option<Cow<'static, str>> = None;
@@ -210,15 +265,10 @@ fn calculate(
         } else {
             m.temp = Some(effective);
         }
-        let points = policy
-            .curve
-            .and_then(|index| array(curves).get(index))
-            .map(|c| &c["points"])
-            .unwrap_or(&f["points"]);
         let mut d = if policy.manual {
             policy.manual_duty
         } else {
-            interpolate(points, effective)
+            interpolate_points(&policy.points, effective)
         };
         automatic = c.is_some_and(|c| yes(&c["curve_zero_auto"])) && !policy.manual && d == 0.;
         if !automatic {
@@ -248,7 +298,7 @@ fn calculate(
         d
     };
     if let Some(c) = c.filter(|c| c["temperature_sensor_id"].is_string()) {
-        let own = source_value(&c["temperature_sensor_id"], &s.sensors);
+        let own = inputs.temperature(s, text(&c["temperature_sensor_id"]));
         if own.is_none() {
             duty = 100.;
             fault = Some("显卡自身温度不可用，保护输出 100%".into());
@@ -257,7 +307,7 @@ fn calculate(
             fault = Some("显卡达到保护温度，输出 100%".into());
         }
     }
-    let tach = s.fans.iter().find(|v| v["id"] == f["rpm_sensor_id"]);
+    let tach = inputs.fans.get(&s.fans, text(&f["rpm_sensor_id"]));
     let rpm = tach.and_then(|v| v["rpm"].as_f64());
     if active
         && duty > 0.
@@ -330,6 +380,7 @@ pub struct Engine {
     pub hardware: Box<dyn Hardware>,
     pub config: Value,
     policies: Vec<Policy>,
+    inputs: Inputs,
     pub snapshot: Snapshot,
     pub outputs: HashMap<String, Output>,
     pub enabled: HashSet<String>,
@@ -385,6 +436,7 @@ impl Engine {
         let mut e = Self {
             hardware,
             policies: Policy::all(&config),
+            inputs: Inputs::default(),
             config,
             snapshot: Snapshot::default(),
             outputs: HashMap::new(),
@@ -475,20 +527,24 @@ impl Engine {
     pub fn tick(&mut self) -> Result<()> {
         // Reconnect configured devices even with every browser closed. Healthy
         // background operation never enumerates topology on a periodic timer.
-        let recovery = array(&self.config["fans"]).iter().any(|f| {
-            !text(&f["channel_id"]).is_empty()
-                && (!self
-                    .snapshot
-                    .channels
-                    .iter()
-                    .any(|c| c["id"] == f["channel_id"])
-                    || ((yes(&f["autostart"]) || self.enabled.contains(text(&f["id"])))
-                        && source_values(&f["sensor_ids"], &self.snapshot.sensors).is_none()))
-        });
+        let recovery = array(&self.config["fans"])
+            .iter()
+            .zip(&self.policies)
+            .any(|(f, p)| {
+                !text(&f["channel_id"]).is_empty()
+                    && (self
+                        .inputs
+                        .channels
+                        .get(&self.snapshot.channels, text(&f["channel_id"]))
+                        .is_none()
+                        || ((yes(&f["autostart"]) || self.enabled.contains(text(&f["id"])))
+                            && p.values(&self.snapshot, &self.inputs).is_none()))
+            });
         let now = self.now();
         let force = self.discovery.due(now, recovery);
         let mut sample = std::mem::take(&mut self.snapshot);
         if let Err(error) = self.hardware.sample_into(force, &mut sample) {
+            self.inputs.refresh(&sample);
             self.snapshot = sample;
             return Err(error);
         }
@@ -502,6 +558,7 @@ impl Engine {
         result
     }
     fn apply_sample(&mut self, s: &Snapshot, now: f64) -> Result<()> {
+        self.inputs.refresh(s);
         if self
             .identification
             .as_ref()
@@ -558,21 +615,14 @@ impl Engine {
                 );
             }
             let m = self.memory.get_mut(id).unwrap();
-            let mut o = calculate(
-                f,
-                &self.config["curves"],
-                &self.policies[index],
-                s,
-                m,
-                active,
-                now,
-            );
+            let mut o = calculate(f, &self.policies[index], s, &self.inputs, m, active, now);
             if active {
                 let key = text(&f["channel_id"]);
-                let result = if s
+                let result = if self
+                    .inputs
                     .channels
-                    .iter()
-                    .any(|c| text(&c["id"]) == key && yes(&c["writable"]))
+                    .get(&s.channels, key)
+                    .is_some_and(|c| yes(&c["writable"]))
                 {
                     self.hardware.write(key, m.duty.unwrap())
                 } else {
@@ -649,11 +699,26 @@ impl Engine {
     pub fn state(&self, since: Option<&str>, after: Option<f64>) -> Value {
         let (gpu_error, gpu_control_error) = self.hardware.errors();
         let identification=self.identification.as_ref().map(|t|json!({"channel_id":t.channel,"duty":t.duty,"effective_duty":t.effective,"fault":t.fault,"remaining_s":(t.expires-self.now()).max(0.).ceil(),"stopping":t.stopping}));
-        let mut v = json!({"sensors":self.snapshot.sensors,"fans":self.snapshot.fans,"channels":self.snapshot.channels,"chips":self.snapshot.chips,"outputs":self.outputs.iter().map(|(id,o)|(id.clone(),o.value())).collect::<serde_json::Map<_,_>>(),
+        let mut v = json!({"sensors":self.snapshot.sensors,"fans":self.snapshot.fans,"channels":self.snapshot.channels,"chips":self.snapshot.chips,
             "history_delta":after.is_some(),
             "events":self.events,"demo":self.demo,"control_allowed":self.allow,"error":self.error,"gpu_error":gpu_error,"gpu_control_error":gpu_control_error,
-            "time":wall(),"discovery":self.discovery(),"identification":identification,"background_service":self.managed,"config_revision":self.revision,"workspace_api":2,
-            "pending_autostart":self.pending.iter().map(|(id,p)|(id.clone(),json!(p.0))).collect::<serde_json::Map<_,_>>(),"runtime":"rust"});
+            "time":wall(),"identification":identification,"background_service":self.managed,"config_revision":self.revision,"workspace_api":2,
+            "runtime":"rust"});
+        // Move freshly built JSON into the response. Passing these collections
+        // through json! would serialize and clone their entire Value trees.
+        v["outputs"] = Value::Object(
+            self.outputs
+                .iter()
+                .map(|(id, o)| (id.clone(), o.value()))
+                .collect(),
+        );
+        v["pending_autostart"] = Value::Object(
+            self.pending
+                .iter()
+                .map(|(id, p)| (id.clone(), json!(p.0)))
+                .collect(),
+        );
+        v["discovery"] = Value::Array(self.discovery());
         v["history"] = Value::Array(
             self.history
                 .iter()
@@ -679,20 +744,22 @@ impl Engine {
             "cpu":Self::group(&self.snapshot.sensors,"cpu"),"gpu":Self::group(&self.snapshot.sensors,"gpu"),
             "view_revision":self.view_revision,"fans_delta":unchanged,
             "history_cursor":self.history_cursor,"history_delta":after.is_some(),
-            "fans":array(&self.config["fans"]).iter().map(|f|{
-                if unchanged {
-                    return json!({"id":f["id"],"output":self.outputs.get(text(&f["id"])).map(Output::value),
-                        "pending":self.pending.get(text(&f["id"])).map(|p|&p.0)});
-                }
+        });
+        v["fans"] = Value::Array(array(&self.config["fans"]).iter().map(|f|{
+            let mut fan = if unchanged {
+                json!({"id":f["id"],"pending":self.pending.get(text(&f["id"])).map(|p|&p.0)})
+            } else {
                 let curve = array(&self.config["curves"]).iter().find(|c| c["id"] == f["curve_id"]);
                 json!({
                     "id":f["id"],"name":f["name"],"mode":f["mode"],
                     "points":curve.map(|c|&c["points"]).unwrap_or(&f["points"]),
                     "curve_name":curve.map(|c|&c["name"]),
-                    "output":self.outputs.get(text(&f["id"])).map(Output::value),
                     "pending":self.pending.get(text(&f["id"])).map(|p|&p.0)
                 })
-            }).collect::<Vec<_>>()});
+            };
+            fan["output"] = self.outputs.get(text(&f["id"])).map(Output::value).unwrap_or(Value::Null);
+            fan
+        }).collect());
         v["history"] = Value::Array(
             self.history
                 .iter()
@@ -709,7 +776,7 @@ impl Engine {
             let rpm=self.snapshot.fans.iter().find(|s|s["id"]==rpm_id).map(|s|s["rpm"].clone()).unwrap_or(Value::Null);
             let mut result=c.clone();let obj=result.as_object_mut().unwrap();
             obj.extend(json!({"rpm_sensor_id":rpm_id,"rpm":rpm,"connection":if num(&rpm)>0.{"rotating"}else if yes(&c["present"]){"present"}else{"unconfirmed"},
-                "fan_id":f.map(|f|&f["id"]),"display_name":f.map(|f|&f["name"]).unwrap_or(&c["name"]),"identified":f.is_some_and(|f|yes(&f["identified"])),"device_kind":f.map(|f|&f["device_kind"]).unwrap_or(&json!("unknown"))}).as_object().unwrap().clone());
+                "fan_id":f.map(|f|&f["id"]),"display_name":f.map(|f|&f["name"]).unwrap_or(&c["name"]),"identified":f.is_some_and(|f|yes(&f["identified"])),"device_kind":f.map(|f|&f["device_kind"]).unwrap_or(&json!("unknown"))}).as_object_mut().map(std::mem::take).unwrap());
             result
         }).collect()
     }
@@ -1037,6 +1104,7 @@ impl Engine {
             }) {
                 if let Some(m) = self.memory.get_mut(text(&f["id"])) {
                     m.samples.clear();
+                    m.sample_sum = 0.;
                     m.temp = None;
                 }
             }
