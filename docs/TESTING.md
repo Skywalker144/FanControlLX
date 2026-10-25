@@ -36,6 +36,14 @@ node --check static/view.js
 bash -n install-service.sh webui.sh build.sh
 ```
 
+控制循环和 hwmon 分配基准默认忽略，显式运行：
+
+```bash
+cargo test --release --locked benchmark_ -- --ignored --nocapture --test-threads=1
+```
+
+基准使用演示数据和临时 hwmon 文件，不访问真实硬件；只在测试构建中启用计数分配器。输出每轮分配次数、累计申请字节和耗时，不能把申请字节当成常驻内存。测量条件及对照记录见 [常驻开销优化](PERFORMANCE_2026-10-25.md)。
+
 黑盒 GPU 测试需要 C 编译器，动态库只注入测试子进程。安装单元测试不会调用真实 systemctl、安装驱动或修改系统目录。
 
 浏览器回归使用临时演示服务，先验证默认观看页没有编辑控件、没有 POST 请求、不加载编辑脚本，再测试 `/edit` 原有全部工作流；截图保存在 `test-results/`。启动命令见 README。性能报告的历史原始数据保留，删除旧实现不会改变当时的测量结果。
