@@ -5,12 +5,23 @@ import {mkdtemp, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 
-const [url='http://127.0.0.1:18091', output='test-results/frontend.json']=process.argv.slice(2);
+const [url='http://127.0.0.1:18091', output='test-results/frontend.json', size]=process.argv.slice(2);
 if(!process.env.CHROME_BIN)throw new Error('Set CHROME_BIN to an existing Chromium executable');
 const health=await(await fetch(new URL('/api/view',url))).json();
 if(!health.demo)throw new Error('Benchmark requires an isolated demo instance');
+if(size && size!=='--large')throw new Error('Optional third argument: --large (replaces disposable demo configuration)');
+if(size==='--large'){
+  const state=await(await fetch(new URL('/api/state',url))).json(),fan=state.config.fans[0];
+  if(!state.demo)throw new Error('Refusing to replace a non-demo configuration');
+  const points=Array.from({length:32},(_,i)=>[20+i*80/31,Math.min(100,i*4)]);
+  const config={version:2,
+    curves:Array.from({length:128},(_,i)=>({id:`curve-${i}`,name:`Curve ${i}`,points})),
+    fans:Array.from({length:64},(_,i)=>({...fan,id:`fan-${i}`,name:`Fan ${i}`,points,curve_id:`curve-${i}`,channel_id:null,rpm_sensor_id:null,identified:false,autostart:false}))};
+  const response=await fetch(new URL('/api/config',url),{method:'POST',headers:{'Content-Type':'application/json','X-FanControl-Token':state.csrf_token},body:JSON.stringify(config)});
+  if(!response.ok)throw new Error(await response.text());
+}
 const profile=await mkdtemp(join(tmpdir(),'fancontrollx-perf-'));
-const browser=spawn(process.env.CHROME_BIN,['--headless','--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--remote-debugging-port=0',`--user-data-dir=${profile}`,'about:blank'],{stdio:['ignore','ignore','pipe']});
+const browser=spawn(process.env.CHROME_BIN,['--headless','--no-sandbox','--no-first-run','--no-default-browser-check','--password-store=basic','--use-mock-keychain','--disable-background-networking','--disable-component-update','--disable-sync','--disable-dev-shm-usage','--disable-gpu','--remote-debugging-port=0',`--user-data-dir=${profile}`,'about:blank'],{stdio:['ignore','ignore','pipe']});
 let socket;
 try{
   const endpoint=await new Promise((resolve,reject)=>{
@@ -48,7 +59,7 @@ try{
   for(const scenario of ['viewer','editor','curve-library']){
     await send('Page.navigate',{url:new URL(scenario==='viewer'?'/':'/edit',url).href});
     await waitFor(`document.getElementById('connection-text')?.textContent.includes('已连接')`);
-    // Repeatable telemetry: fixed configuration/history, one changed reading per
+    // Repeatable telemetry: fixed configuration, changing 80-sample history per
     // poll. This measures rendering, not random demo values or backend sampling.
     await evaluate(`(async()=>{
       const path=${JSON.stringify(scenario==='viewer'?'/api/view':'/api/state')};
@@ -57,6 +68,15 @@ try{
       window.fetch=(input,...args)=>{
         if(String(input).split('?')[0]!==path)return original(input,...args);
         const s=structuredClone(snapshot);tick++;window.__polls++;
+        // Match production polling: stable configuration objects are retained
+        // by the client while telemetry changes on every response.
+        const since=new URL(String(input),location.href).searchParams.get('since');
+        if(path==='/api/state'&&since===s.config_revision)delete s.config;
+        if(path==='/api/view'&&since===s.view_revision){
+          s.fans_delta=true;
+          s.fans=s.fans.map(({id,output,pending})=>({id,output,pending}));
+        }
+        s.history=Array.from({length:80},(_,i)=>({time:i+tick,cpu:45+(i+tick)%10,gpu:40+(i+tick)%8}));
         if(s.fans&&s.cpu!==undefined){s.cpu=45+tick%10;s.sample_time+=tick;for(const f of s.fans){f.output.actual=40+tick%10;f.output.temperature=45+tick%10;}}
         else{s.time+=tick;for(const o of Object.values(s.outputs)){o.actual=40+tick%10;o.temperature=45+tick%10;}}
         return Promise.resolve(new Response(JSON.stringify(s),{headers:{'Content-Type':'application/json'}}));
@@ -81,7 +101,7 @@ try{
     console.log(JSON.stringify(samples.at(-1)));
   }
   if(errors.length)throw new Error(JSON.stringify(errors));
-  await writeFile(output,JSON.stringify({browser:await send('Browser.getVersion',{},null),conditions:'Headless, GPU disabled, 1440x1100; 6.5 seconds per scenario; deterministic changing telemetry, fixed history/config; heap after GC; renderer task time includes measurement overhead; not process RSS or power.',samples},null,2)+'\n');
+  await writeFile(output,JSON.stringify({browser:await send('Browser.getVersion',{},null),configuration:size==='--large'?'64 offline fans, 128 curves, 32 points':'existing demo configuration',conditions:'Headless, GPU disabled, 1440x1100; 6.5 seconds per scenario; deterministic changing telemetry and 80-sample history, fixed config; heap after GC; renderer task time includes measurement overhead; not process RSS or power.',samples},null,2)+'\n');
 }finally{
   socket?.close();browser.kill('SIGTERM');
   await new Promise(resolve=>{browser.once('exit',resolve);setTimeout(resolve,2000);});
