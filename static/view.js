@@ -1,4 +1,4 @@
-import {miniCurve, updateMiniCurve} from './curve.js';
+import {updateCardCurve, releaseCardCurve} from './curve.js';
 import {icon, text, attribute, spark, updateOutputBar, initFanColumns, formatTime, createCardVisibility} from './ui.js';
 
 const $=id=>document.getElementById(id);
@@ -6,7 +6,7 @@ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const numberFormat=new Intl.NumberFormat('zh-CN',{maximumFractionDigits:1});
 const fmt=v=>v==null?'—':numberFormat.format(Number(v));
 let state,connected=false,timer,generation=0,sequence=0,applied=0;
-const cardVisibility=createCardVisibility(render);
+const cardVisibility=createCardVisibility(render,releaseCardCurve);
 initFanColumns($('fan-columns'),$('fan-cards'));
 function render(){
   $('connection-error').hidden=connected;
@@ -29,17 +29,22 @@ function render(){
   for(const [index,f] of state.fans.entries()){
     let card=cards.get(f.id);
     if(!card){card=document.createElement('article');card.className='fan-card view-card';card.dataset.fan=f.id;$('fan-cards').append(card);}
-    const signature=JSON.stringify([f.name,f.mode,f.curve_name,f.points]);
+    // Delta responses retain the points array; full responses compare curve content.
+    if(card._points!==f.points||card._name!==f.name||card._mode!==f.mode||card._curveName!==f.curve_name){
+      card._points=f.points;card._name=f.name;card._mode=f.mode;card._curveName=f.curve_name;
+      card._nextSignature=JSON.stringify([f.name,f.mode,f.curve_name,f.points]);
+    }
+    const signature=card._nextSignature;
     if(card._signature!==signature){
       card._signature=signature;
       card.innerHTML=`<div class="card-top"><span class="fan-symbol">${icon('fan')}</span><div class="card-name"><h3>${esc(f.name)}</h3><div class="chip-label">${f.mode==='manual'?'手动模式':'曲线模式'} · ${esc(f.curve_name||'独立曲线')}</div></div><span data-live="status" class="status-tag"></span></div>
         <div class="fan-values"><div class="output-reading"><strong data-live="actual"></strong><small>% 输出</small></div><div class="reading"><span data-live="rpm"></span> RPM<br><span data-live="temperature"></span> °C 输入</div></div><div class="progress" role="img"><i data-live="progress"></i><span data-output-target hidden></span></div>
-        <div class="fan-curve-preview">${miniCurve(f.points,true)}</div><p class="view-fault" data-live="fault" hidden></p>`;
+        <div class="fan-curve-preview"></div><p class="view-fault" data-live="fault" hidden></p>`;
       card._live=Object.fromEntries([...card.querySelectorAll('[data-live]')].map(el=>[el.dataset.live,el]));
-      card._curve=card.querySelector('.fan-curve-preview>svg');
+      card._curve=null;
     }
     if($('fan-cards').children[index]!==card)$('fan-cards').insertBefore(card,$('fan-cards').children[index]||null);
-    if(!cardVisibility.visible(card,ids.size>16))continue;
+    if(!cardVisibility.visible(card,ids.size>16)){releaseCardCurve(card);continue;}
     const o=f.output||{},live=card._live,value=k=>fmt(connected?o[k]:null);
     const active=connected&&!!o.active,fault=active&&!!o.fault;
     card.classList.toggle('is-active',active);card.classList.toggle('has-fault',fault);
@@ -49,7 +54,7 @@ function render(){
     updateOutputBar(live.progress.parentElement,connected?o:{});
     const message=connected?(o.fault||f.pending||''):'';
     text(live.fault,message);if(live.fault.hidden!==!message)live.fault.hidden=!message;
-    updateMiniCurve(card._curve,f.points,connected?o.temperature:null,f.mode);
+    updateCardCurve(card,f.points,connected?o.temperature:null,f.mode);
   }
   text($('last-update'),connected?`采样于 ${formatTime(state.sample_time)}`:'读数已过期');
 }

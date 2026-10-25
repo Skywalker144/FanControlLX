@@ -1,6 +1,7 @@
 use crate::{
     common::*,
     runtime::{Client, Operation},
+    state::Metadata,
 };
 use serde_json::{json, Value};
 use std::{
@@ -97,7 +98,7 @@ fn assets() -> &'static [Asset] {
 }
 
 // At most two current-generation responses and 256 KiB of retained payloads.
-// Idle control cycles only advance an atomic generation; they build no JSON.
+// Control cycles advance the atomic response generation.
 #[derive(Default)]
 struct ResponseCache {
     generation: u64,
@@ -290,14 +291,9 @@ fn handle(
         let bytes = if let Some(bytes) = cached {
             bytes
         } else {
-            let mut value = engine.call(operation)?;
-            if path == "/api/state" {
-                value["csrf_token"] = json!(token);
-            }
-            value["version"] = json!(VERSION);
-            value["hostname"] = json!(hostname);
-            // Serialization and socket writes stay entirely on HTTP workers.
-            let bytes: Arc<[u8]> = serde_json::to_vec(&value)?.into();
+            let response = engine.call(operation)?;
+            // Serialize fields borrowed from the immutable snapshot.
+            let bytes: Arc<[u8]> = response.encode(Metadata { token, hostname })?.into();
             cache.lock().map_err(|_| conflict("状态缓存异常"))?.insert(
                 generation,
                 key,
@@ -350,7 +346,7 @@ fn handle(
     reply(
         s,
         200,
-        &serde_json::to_vec(&result)?,
+        &result.encode(Metadata { token, hostname })?,
         "application/json; charset=utf-8",
     )?;
     Ok(())

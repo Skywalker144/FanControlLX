@@ -2,7 +2,7 @@
 """Measure one binary in disposable demo mode, never the installed service.
 
 Records idle process CPU/RSS, repeated API reads, and control sampling under load.
-Use identical --requests and --idle-seconds for before/after comparisons.
+The measurement window is set by --requests and --idle-seconds.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +25,8 @@ def main():
     parser.add_argument("--label", required=True)
     parser.add_argument("--requests", type=int, default=10000)
     parser.add_argument("--idle-seconds", type=int, default=8)
+    parser.add_argument("--uncached", action="store_true",
+                        help="Use a unique query key per read to measure encoding, not byte-cache hits")
     args = parser.parse_args()
     if not 10 <= args.requests <= 100000 or not 1 <= args.idle_seconds <= 300:
         parser.error("Use 10–100000 requests and 1–300 idle seconds")
@@ -103,9 +105,10 @@ def main():
                     before = usage()
                     started = time.perf_counter()
 
-                    def one(_):
+                    def one(index):
                         at = time.perf_counter()
-                        status, body, _ = request(path)
+                        query = path + ("&" if "?" in path else "?") + f"benchmark_request={index}" if args.uncached else path
+                        status, body, _ = request(query)
                         if status != 200:
                             raise RuntimeError(f"HTTP {status}: {body[:200]!r}")
                         return (time.perf_counter() - at) * 1000, len(body)
@@ -140,7 +143,7 @@ def main():
                     if status != 200:
                         raise RuntimeError(body.decode())
                     full_sizes.append(len(request("/api/view")[1]))
-                    # Old binaries naturally fall back to the complete response.
+                    # Use the complete response when no history cursor is available.
                     path = "/api/view"
                     if "view_revision" in view:
                         path += f"?since={view['view_revision']}&after={view['history_cursor']}"
@@ -160,6 +163,7 @@ def main():
             etag = headers.get("ETag")
             cached_status, cached_body, _ = request("/icons.svg", headers={"If-None-Match": etag or '"baseline"'})
             result = {"label": args.label, "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                      "response_byte_cache": "bypassed with unique query keys" if args.uncached else "warm",
                       "binary_bytes": binary.stat().st_size, "measured_at_unix": time.time(),
                       "method": "Linux per-thread schedstat runtime in ns plus process CPU ticks; isolated demo; no hardware writes; process user+system CPU from /proc/<pid>/stat (10ms granularity on this host); RSS is process memory, not cgroup; 2 concurrent closed-connection clients; short synthetic load, not production power.",
                       "results": results, "icon_response_bytes": len(body), "icon_revalidation_status": cached_status,

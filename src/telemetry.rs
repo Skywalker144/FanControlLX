@@ -22,7 +22,7 @@ impl RowIndex {
         self.positions.clear();
         self.len = rows.len();
         for (i, row) in rows.iter().enumerate() {
-            // Match the original first-match lookup even for duplicate IDs.
+            // For duplicate IDs, the first entry takes precedence.
             self.positions
                 .entry(text(&row["id"]).to_owned())
                 .or_insert(i);

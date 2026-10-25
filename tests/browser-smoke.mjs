@@ -51,8 +51,7 @@ try{
     await waitFor('!document.getElementById("confirm-dialog").open');
   };
   const editorFits=async label=>{
-    // A faster backend can finish a save before the dialog's opening animation.
-    // Measure layout after that animation, not at an arbitrary in-between frame.
+    // Wait for the dialog's opening animation before measuring its layout.
     await evaluate(`(async()=>{await Promise.all(document.getElementById('curve-dialog').getAnimations({subtree:true}).map(a=>a.finished.catch(()=>{})));await new Promise(requestAnimationFrame)})()`);
     const layout=await evaluate(`(()=>{const d=document.getElementById('curve-dialog'),b=d.getBoundingClientRect();return{fits:d.scrollHeight<=d.clientHeight+1&&d.scrollWidth<=d.clientWidth+1&&b.top>=0&&b.bottom<=innerHeight,height:d.clientHeight,scrollHeight:d.scrollHeight,parts:Array.from(d.querySelector('form').children).map(el=>[el.className,el.getBoundingClientRect().height])}})()`);
     assert.equal(layout.fits,true,`Curve editor must fit without scrolling: ${label}: ${JSON.stringify(layout)}`);
@@ -143,11 +142,15 @@ try{
   await waitFor(`document.querySelectorAll('[data-fan]').length===24`);
   // Allow viewport observation, then change an offscreen card's state.
   await new Promise(resolve=>setTimeout(resolve,200));
+  assert.equal(await evaluate(`document.querySelector('[data-fan="visible-23"] .fan-curve-preview').children.length`),0,'Offscreen viewer releases its SVG');
+  const viewerHeight=await evaluate(`document.getElementById('fan-cards').getBoundingClientRect().height`);
   await evaluate(`window.mockViewerState.fans.forEach(f=>f.output.actual=77);document.getElementById('retry').click()`);
   await waitFor(`document.querySelector('[data-live="actual"]').textContent==='77'`);
   assert.equal(await evaluate(`document.querySelector('[data-fan="visible-23"] [data-live="actual"]').textContent`),'66','Large workspaces defer offscreen telemetry DOM updates');
   await evaluate(`document.querySelector('[data-fan="visible-23"]').scrollIntoView({block:'center'})`);
   await waitFor(`document.querySelector('[data-fan="visible-23"] [data-live="actual"]').textContent==='77'`);
+  await waitFor(`!!document.querySelector('[data-fan="visible-23"] .fan-curve-preview>svg') && !document.querySelector('[data-fan="visible-0"] .fan-curve-preview>svg')`);
+  assert.ok(Math.abs(await evaluate(`document.getElementById('fan-cards').getBoundingClientRect().height`)-viewerHeight)<1,'Lazy card previews preserve layout height');
   await evaluate(`window.mockViewerState.fans=window.smallViewerFans;window.scrollTo(0,0);document.getElementById('retry').click()`);
   await waitFor(`document.querySelectorAll('[data-fan]').length===window.smallViewerFans.length`);
   await evaluate(`window.fetch=()=>Promise.reject(new Error('simulated disconnect'));document.getElementById('retry').click()`);
@@ -205,6 +208,19 @@ try{
     const first=config.fans[0].id,second=config.fans[1].id;
     const card=id=>`document.querySelector('[data-fan="${id}"]')`;
     const post=async(path,body)=>evaluate(`(async()=>{const s=await(await fetch('/api/state')).json();const r=await fetch(${JSON.stringify(path)},{method:'POST',headers:{'Content-Type':'application/json','X-FanControl-Token':s.csrf_token},body:JSON.stringify(${JSON.stringify(body)})});if(!r.ok)throw new Error(await r.text());return r.json()})()`);
+    await post('/api/config',{...config,fans:Array.from({length:24},(_,i)=>({...config.fans[0],id:`preview-${i}`,channel_id:null,rpm_sensor_id:null,identified:false,autostart:false}))});
+    await evaluate(`window.scrollTo(0,0);document.getElementById('retry').click()`);
+    await waitFor(`document.querySelectorAll('[data-fan]').length===24 && !document.querySelector('[data-fan="preview-23"] .fan-curve-preview>svg')`);
+    const editorHeight=await evaluate(`document.getElementById('fan-cards').getBoundingClientRect().height`);
+    await evaluate(`document.querySelector('[data-fan="preview-23"]').scrollIntoView({block:'center'})`);
+    await waitFor(`!!document.querySelector('[data-fan="preview-23"] .fan-curve-preview>svg') && !document.querySelector('[data-fan="preview-0"] .fan-curve-preview>svg')`);
+    assert.ok(Math.abs(await evaluate(`document.getElementById('fan-cards').getBoundingClientRect().height`)-editorHeight)<1,'Editor previews release SVGs without moving controls');
+    await evaluate(`document.querySelector('[data-fan="preview-23"] [data-edit-curve]').click()`);
+    await waitFor(`document.getElementById('curve-dialog').open`);
+    await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
+    await post('/api/config',config);
+    await evaluate(`window.scrollTo(0,0);document.getElementById('retry').click()`);
+    await waitFor(`document.querySelectorAll('[data-fan]').length===3`);
     const largeLibrary=Array.from({length:20},(_,i)=>({id:`lazy-${i}`,name:`曲线 ${i}`,points:[[30,20],[80,100]]}));
     await post('/api/config',{...config,curves:largeLibrary});
     await evaluate(`document.getElementById('retry').click()`);

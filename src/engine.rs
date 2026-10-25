@@ -4,12 +4,14 @@ use crate::{
     hardware::{Hardware, Snapshot},
     telemetry::Inputs,
 };
+use serde_core::{ser::SerializeMap, Serialize, Serializer};
 use serde_json::{json, Value};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     fs,
     path::PathBuf,
+    sync::Arc,
     time::Instant,
 };
 
@@ -174,8 +176,9 @@ impl Policy {
     }
 }
 
-// The control loop retains numbers and static messages, not a JSON tree per
-// fan per second. Allocate the API representation only when it is requested.
+// Control results contain numeric values and status messages.
+// HTTP workers serialize these fields from an immutable snapshot.
+#[derive(Clone)]
 pub struct Output {
     temperature: Option<f64>,
     smoothed: Option<f64>,
@@ -188,12 +191,20 @@ pub struct Output {
     active: bool,
     fault: Option<Cow<'static, str>>,
 }
-impl Output {
-    fn value(&self) -> Value {
-        json!({"temperature":self.temperature.map(rounded),"smoothed":self.smoothed.map(rounded),
-            "target":rounded(self.target),"rpm":self.rpm,"status":self.status,
-            "requested":rounded(self.requested),"actual":self.actual,"automatic":self.automatic,
-            "active":self.active,"fault":self.fault})
+impl Serialize for Output {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut m = serializer.serialize_map(Some(10))?;
+        m.serialize_entry("temperature", &self.temperature.map(rounded))?;
+        m.serialize_entry("smoothed", &self.smoothed.map(rounded))?;
+        m.serialize_entry("target", &rounded(self.target))?;
+        m.serialize_entry("rpm", &self.rpm)?;
+        m.serialize_entry("status", &self.status)?;
+        m.serialize_entry("requested", &rounded(self.requested))?;
+        m.serialize_entry("actual", &self.actual)?;
+        m.serialize_entry("automatic", &self.automatic)?;
+        m.serialize_entry("active", &self.active)?;
+        m.serialize_entry("fault", &self.fault)?;
+        m.end()
     }
 }
 #[cfg(test)]
@@ -207,7 +218,16 @@ pub fn compute(
 ) -> Value {
     let mut inputs = Inputs::default();
     inputs.refresh(s);
-    calculate(f, &Policy::new(f, curves), s, &inputs, m, active, now).value()
+    serde_json::to_value(calculate(
+        f,
+        &Policy::new(f, curves),
+        s,
+        &inputs,
+        m,
+        active,
+        now,
+    ))
+    .unwrap()
 }
 fn calculate(
     f: &Value,
@@ -364,21 +384,25 @@ struct Identification {
     fault: Option<String>,
     expires: f64,
 }
-// Keep history as numbers in the control loop. JSON objects and field names
-// are only allocated when an HTTP client actually asks for these samples.
-struct HistorySample {
-    time: f64,
+// Compact numeric history is copied only when a reader requests a new sample.
+#[derive(Clone)]
+pub(crate) struct HistorySample {
+    pub time: f64,
     cpu: Option<f64>,
     gpu: Option<f64>,
 }
-impl HistorySample {
-    fn value(&self) -> Value {
-        json!({"time":self.time,"cpu":self.cpu,"gpu":self.gpu})
+impl Serialize for HistorySample {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut m = serializer.serialize_map(Some(3))?;
+        m.serialize_entry("time", &self.time)?;
+        m.serialize_entry("cpu", &self.cpu)?;
+        m.serialize_entry("gpu", &self.gpu)?;
+        m.end()
     }
 }
 pub struct Engine {
     pub hardware: Box<dyn Hardware>,
-    pub config: Value,
+    pub config: Arc<Value>,
     policies: Vec<Policy>,
     inputs: Inputs,
     pub snapshot: Snapshot,
@@ -437,7 +461,7 @@ impl Engine {
             hardware,
             policies: Policy::all(&config),
             inputs: Inputs::default(),
-            config,
+            config: Arc::new(config),
             snapshot: Snapshot::default(),
             outputs: HashMap::new(),
             enabled: HashSet::new(),
@@ -483,7 +507,7 @@ impl Engine {
         self.outputs
             .retain(|id, _| array(&v["fans"]).iter().any(|f| text(&f["id"]) == id));
         self.policies = Policy::all(&v);
-        self.config = v;
+        self.config = Arc::new(v);
         Ok(())
     }
     fn queue(&mut self) {
@@ -598,8 +622,7 @@ impl Engine {
                 return Err(e);
             }
         }
-        // Indexing gives each fan a short borrow. Only failure metadata is
-        // copied before recovery; the full configuration is never cloned here.
+        // End each configuration borrow before running hardware recovery.
         for index in 0..array(&self.config["fans"]).len() {
             let f = &self.config["fans"][index];
             let id = text(&f["id"]);
@@ -696,78 +719,54 @@ impl Engine {
             .filter_map(|s| s["value"].as_f64())
             .reduce(f64::max)
     }
-    pub fn state(&self, since: Option<&str>, after: Option<f64>) -> Value {
-        let (gpu_error, gpu_control_error) = self.hardware.errors();
-        let identification=self.identification.as_ref().map(|t|json!({"channel_id":t.channel,"duty":t.duty,"effective_duty":t.effective,"fault":t.fault,"remaining_s":(t.expires-self.now()).max(0.).ceil(),"stopping":t.stopping}));
-        let mut v = json!({"sensors":self.snapshot.sensors,"fans":self.snapshot.fans,"channels":self.snapshot.channels,"chips":self.snapshot.chips,
-            "history_delta":after.is_some(),
-            "events":self.events,"demo":self.demo,"control_allowed":self.allow,"error":self.error,"gpu_error":gpu_error,"gpu_control_error":gpu_control_error,
-            "time":wall(),"identification":identification,"background_service":self.managed,"config_revision":self.revision,"workspace_api":2,
-            "runtime":"rust"});
-        // Move freshly built JSON into the response. Passing these collections
-        // through json! would serialize and clone their entire Value trees.
-        v["outputs"] = Value::Object(
-            self.outputs
-                .iter()
-                .map(|(id, o)| (id.clone(), o.value()))
-                .collect(),
-        );
-        v["pending_autostart"] = Value::Object(
-            self.pending
-                .iter()
-                .map(|(id, p)| (id.clone(), json!(p.0)))
-                .collect(),
-        );
-        v["discovery"] = Value::Array(self.discovery());
-        v["history"] = Value::Array(
-            self.history
-                .iter()
-                .filter(|h| after.is_none_or(|t| h.time > t))
-                .map(HistorySample::value)
-                .collect(),
-        );
-        if since != Some(&self.revision) {
-            v["config"] = self.config.clone();
+    pub fn read_snapshot(&self, editor: bool) -> crate::state::ReadSnapshot {
+        crate::state::ReadSnapshot {
+            config: self.config.clone(),
+            outputs: self.outputs.clone(),
+            pending: self.pending.iter()
+                .map(|(id, p)| (id.clone(), p.0.clone())).collect(),
+            history: self.history.iter()
+                .skip(if editor { 0 } else { self.history.len().saturating_sub(80) })
+                .cloned().collect(),
+            editor: editor.then(|| {
+                let (gpu_error, gpu_control_error) = self.hardware.errors();
+                crate::state::EditorSnapshot {
+                    hardware: self.snapshot.clone(),
+                    events: self.events.clone(),
+                    allow: self.allow,
+                    gpu_error,
+                    gpu_control_error,
+                    identification: self.identification.as_ref().map(|t| json!({
+                        "channel_id":t.channel,"duty":t.duty,"effective_duty":t.effective,"fault":t.fault,
+                        "remaining_s":(t.expires-self.now()).max(0.).ceil(),"stopping":t.stopping
+                    })),
+                }
+            }),
+            demo: self.demo,
+            managed: self.managed,
+            error: self.error.clone(),
+            revision: self.revision.clone(),
+            view_revision: self.view_revision.clone(),
+            history_cursor: self.history_cursor,
+            cpu: Self::group(&self.snapshot.sensors, "cpu"),
+            gpu: Self::group(&self.snapshot.sensors, "gpu"),
         }
-        v
     }
+    #[cfg(test)]
+    pub fn state(&self, since: Option<&str>, after: Option<f64>) -> Value {
+        serde_json::to_value(
+            self.read_snapshot(true)
+                .response(crate::state::Query::Editor { since, after }, None),
+        )
+        .unwrap()
+    }
+    #[cfg(test)]
     pub fn view_state(&self, since: Option<&str>, after: Option<u64>) -> Value {
-        // Only expose cached readings and the resolved curve for display; omit
-        // full configuration, tokens, discovery metadata and logs.
-        let unchanged = since == Some(&self.view_revision);
-        let after = after.filter(|cursor| {
-            unchanged && *cursor <= self.history_cursor && self.history_cursor - cursor <= 80
-        });
-        let count = after.map_or(80, |cursor| (self.history_cursor - cursor) as usize);
-        let mut v = json!({"time":wall(),"sample_time":self.history.back().map(|h|h.time),
-            "runtime":"rust","demo":self.demo,"background_service":self.managed,"error":self.error,
-            "cpu":Self::group(&self.snapshot.sensors,"cpu"),"gpu":Self::group(&self.snapshot.sensors,"gpu"),
-            "view_revision":self.view_revision,"fans_delta":unchanged,
-            "history_cursor":self.history_cursor,"history_delta":after.is_some(),
-        });
-        v["fans"] = Value::Array(array(&self.config["fans"]).iter().map(|f|{
-            let mut fan = if unchanged {
-                json!({"id":f["id"],"pending":self.pending.get(text(&f["id"])).map(|p|&p.0)})
-            } else {
-                let curve = array(&self.config["curves"]).iter().find(|c| c["id"] == f["curve_id"]);
-                json!({
-                    "id":f["id"],"name":f["name"],"mode":f["mode"],
-                    "points":curve.map(|c|&c["points"]).unwrap_or(&f["points"]),
-                    "curve_name":curve.map(|c|&c["name"]),
-                    "pending":self.pending.get(text(&f["id"])).map(|p|&p.0)
-                })
-            };
-            fan["output"] = self.outputs.get(text(&f["id"])).map(Output::value).unwrap_or(Value::Null);
-            fan
-        }).collect());
-        v["history"] = Value::Array(
-            self.history
-                .iter()
-                .skip(self.history.len().saturating_sub(count))
-                .map(HistorySample::value)
-                .collect(),
-        );
-        v
+        serde_json::to_value(
+            self.read_snapshot(false)
+                .response(crate::state::Query::Viewer { since, after }, None),
+        )
+        .unwrap()
     }
     pub fn discovery(&self) -> Vec<Value> {
         self.snapshot.channels.iter().map(|c|{
@@ -800,7 +799,7 @@ impl Engine {
         self.discovery.last = self.now();
         // Apply protection to the newly discovered readings before any disk I/O.
         self.tick_with(snapshot, self.now())?;
-        let mut config = self.config.clone();
+        let mut config = (*self.config).clone();
         let mut placeholders = vec![
             config::default_fan("cpu-fan", "CPU 散热风扇", "@cpu"),
             config::default_fan("case-fan", "机箱风扇", "@cpu-gpu"),
@@ -825,8 +824,7 @@ impl Engine {
             }
         }
         self.commit(config::validate(&config)?, persist)?;
-        // Reconcile newly added configurations using the same fresh scan; do
-        // not read the hardware three times for one discovery operation.
+        // Reconcile newly added configurations using the same fresh scan.
         self.tick_with(self.snapshot.clone(), self.now())?;
         if persist {
             self.event(format!("扫描完成，新增 {added} 个在线设备；未启用新的控制"));
@@ -1149,7 +1147,7 @@ impl Engine {
                 {
                     return Err(invalid("风扇设置字段无效"));
                 }
-                let mut c = self.config.clone();
+                let mut c = (*self.config).clone();
                 let f = c["fans"]
                     .as_array_mut()
                     .unwrap()
@@ -1183,7 +1181,7 @@ impl Engine {
                 {
                     return Err(conflict("风扇顺序已更新，请刷新后重试"));
                 }
-                let mut c = self.config.clone();
+                let mut c = (*self.config).clone();
                 c["fans"] = json!(ids
                     .iter()
                     .map(|id| array(&self.config["fans"])
@@ -1199,7 +1197,7 @@ impl Engine {
                 if !curve.is_object() {
                     return Err(invalid("曲线必须是对象"));
                 }
-                let mut c = self.config.clone();
+                let mut c = (*self.config).clone();
                 let pos = array(&c["curves"])
                     .iter()
                     .position(|p| p["id"] == curve["id"]);
@@ -1234,7 +1232,7 @@ impl Engine {
                 return Ok(json!({"ok":true,"id":id}));
             }
             "/api/curve/delete" => {
-                let mut c = self.config.clone();
+                let mut c = (*self.config).clone();
                 let curve = array(&c["curves"])
                     .iter()
                     .find(|p| p["id"] == v["id"])
@@ -1279,7 +1277,7 @@ impl Engine {
                 if candidate["backend"] == "nvidia" && kind != "fan" {
                     return Err(invalid("NVIDIA 通道只能确认为风扇"));
                 }
-                let mut c = self.config.clone();
+                let mut c = (*self.config).clone();
                 let i = array(&c["fans"])
                     .iter()
                     .position(|f| f["channel_id"] == v["channel_id"])
@@ -1313,7 +1311,7 @@ impl Engine {
                 let id = text(&v["id"]);
                 let enable = path == "/api/activate";
                 if self.managed {
-                    let mut c = self.config.clone();
+                    let mut c = (*self.config).clone();
                     let f = c["fans"]
                         .as_array_mut()
                         .unwrap()
@@ -1340,7 +1338,7 @@ impl Engine {
             }
             "/api/release-all" => {
                 if self.managed {
-                    let mut c = self.config.clone();
+                    let mut c = (*self.config).clone();
                     for f in c["fans"].as_array_mut().unwrap() {
                         f["autostart"] = json!(false);
                     }

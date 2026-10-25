@@ -189,7 +189,7 @@ fn aggregation_counts_groups_once_and_protects_on_any_missing_or_hot_source() {
 #[test]
 fn compiled_policy_tracks_curve_reordering_edits_and_fan_removal() {
     let (_temp, mut e, _hardware, id) = setup(false);
-    let mut config = e.config.clone();
+    let mut config = (*e.config).clone();
     config["curves"] = json!([
         {"id":"a","name":"A","points":[[20,20],[100,20]]},
         {"id":"b","name":"B","points":[[20,70],[100,70]]}]);
@@ -693,7 +693,6 @@ fn writer_journal_failure_never_writes() {
     assert!(w.leases.is_empty());
 }
 
-// Behavioral coverage migrated from the retired Python implementation.
 #[test]
 fn interpolation_defaults_limits_and_zero_motherboard_curve() {
     let (mut f, s, _) = policy();
@@ -764,7 +763,7 @@ fn invalid_configs_do_not_change_running_policy() {
         assert_eq!(e.config, original);
         assert_eq!(e.leases[&id], lease);
     }
-    let mut bad = original.clone();
+    let mut bad = (*original).clone();
     bad["fans"][1]["channel_id"] = bad["fans"][0]["channel_id"].clone();
     assert!(e.request("/api/config", &bad).is_err());
     assert!(e.enabled.contains(&id));

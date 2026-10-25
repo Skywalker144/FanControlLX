@@ -50,9 +50,9 @@ export function updateOutputBar(bar,output={}){
   attribute(bar,'aria-label',`当前输出 ${actual==null?'不可用':`${actual}%`} · 目标 ${output.automatic?'显卡自动调速':available?`${target}%`:'不可用'}`);
 }
 
-// Large workspaces keep their controls and layout, but offscreen live readouts
-// need no DOM work. Entering the viewport renders the newest state immediately.
-export function createCardVisibility(render){
+// Large workspaces refresh live readouts near the viewport.
+// Entering the viewport renders the newest state immediately.
+export function createCardVisibility(render,leave=()=>{}){
   const visibility=new WeakMap();
   const observer=typeof IntersectionObserver==='function'?new IntersectionObserver(entries=>{
     let entered=false;
@@ -60,6 +60,7 @@ export function createCardVisibility(render){
       if(!visibility.has(target))continue;
       entered ||= isIntersecting&&visibility.get(target)!==true;
       visibility.set(target,isIntersecting);
+      if(!isIntersecting)leave(target);
     }
     if(entered&&!document.hidden)render();
   },{rootMargin:'240px'}):null;

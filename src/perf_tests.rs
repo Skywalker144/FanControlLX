@@ -4,6 +4,7 @@ use crate::{
     config,
     engine::Engine,
     hardware::{Demo, Hardware},
+    state::Query,
     tests::Temp,
 };
 use serde_json::json;
@@ -105,13 +106,46 @@ fn benchmark_control_cycles() {
         let view = engine.view_state(None, None);
         let view_revision = view["view_revision"].as_str().unwrap();
         let cursor = view["history_cursor"].as_u64().unwrap();
-        measure(&format!("editor_delta_{count}_fans"), 2000, || {
-            std::hint::black_box(engine.state(Some(revision), Some(f64::MAX)));
+        // Measure snapshot capture and encoding together. Requests in the same
+        // production generation share a snapshot.
+        for delta in [false, true] {
+            let editor = Query::Editor {
+                since: delta.then_some(revision),
+                after: delta.then_some(f64::MAX),
+            };
+            let viewer = Query::Viewer {
+                since: delta.then_some(view_revision),
+                after: delta.then_some(cursor),
+            };
+            for (kind, query) in [("editor", editor), ("viewer", viewer)] {
+                measure(
+                    &format!("{kind}_encode_{count}_fans_delta_{delta}"),
+                    1000,
+                    || {
+                        std::hint::black_box(
+                            serde_json::to_vec(
+                                &engine.read_snapshot(kind == "editor").response(query, None),
+                            )
+                            .unwrap(),
+                        );
+                    },
+                );
+                let snapshot = engine.read_snapshot(kind == "editor");
+                measure(
+                    &format!("{kind}_shared_encode_{count}_fans_delta_{delta}"),
+                    1000,
+                    || {
+                        std::hint::black_box(
+                            serde_json::to_vec(&snapshot.response(query, None)).unwrap(),
+                        );
+                    },
+                );
+            }
+        }
+        measure(&format!("snapshot_capture_{count}_fans"), 2000, || {
+            std::hint::black_box(engine.read_snapshot(true));
         });
-        measure(&format!("viewer_delta_{count}_fans"), 2000, || {
-            std::hint::black_box(engine.view_state(Some(view_revision), Some(cursor)));
-        });
-        let mut config = engine.config.clone();
+        let mut config = (*engine.config).clone();
         for fan in config["fans"].as_array_mut().unwrap() {
             fan["smoothing_s"] = json!(60);
         }

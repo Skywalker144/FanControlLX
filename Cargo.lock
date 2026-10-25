@@ -62,6 +62,7 @@ version = "0.6.1"
 dependencies = [
  "libc",
  "libloading",
+ "serde_core",
  "serde_json",
  "sha2",
  "signal-hook",

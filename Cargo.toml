@@ -7,6 +7,7 @@ description = "Local Linux fan controller with an independent GPU recovery proce
 
 [dependencies]
 serde_json = "1"
+serde_core = { version = "1", features = ["rc"] }
 sha2 = "0.10"
 libc = "0.2"
 libloading = "0.8"

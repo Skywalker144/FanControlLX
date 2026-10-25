@@ -45,9 +45,8 @@ fn read(path: &Path) -> String {
         .to_owned()
 }
 fn number_at(path: &Path) -> Option<f64> {
-    // Sysfs numeric attributes fit in a few bytes. Keep a bounded stack buffer
-    // instead of stat'ing and allocating a String for every reading. Reopen on
-    // each sample so removed/replaced devices never leave a cached descriptor.
+    // Read sysfs numeric attributes into a bounded stack buffer. Reopen each
+    // sample so removed or replaced devices cannot leave a stale descriptor.
     let mut file = fs::File::open(path).ok()?;
     let mut bytes = [0; 64];
     let mut len = 0;
@@ -98,8 +97,6 @@ fn pwm_name(s: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 fn update_field(row: &mut Value, field: &str, value: Value) {
-    // Value's IndexMut allocates a new key even when that key already exists.
-    // Sampling updates existing fields almost exclusively.
     if let Some(current) = row.get_mut(field) {
         *current = value;
     } else {
@@ -367,8 +364,6 @@ impl Real {
                 s.gpu_generation = self.gpu_generation;
             }
             let mut temp_error = false;
-            // Permission/driver diagnostics often stay identical for hours.
-            // Reuse their String as well as the telemetry objects.
             let mut errors = if self.gpu_entries.is_empty() {
                 String::new()
             } else {
@@ -689,10 +684,8 @@ impl Hardware for Real {
             self.request(json!({"action":"restore","channel_id":key,"token":l["token"]}))?;
             self.gpu_leases.remove(key);
             if self.gpu_leases.is_empty() {
-                // The last successful restore no longer needs a resident NVML
-                // writer. Closing its socket lets it finish recovery and exit;
-                // request() starts a fresh writer on the next acquisition.
-                // Failed restores return above and keep the watchdog alive.
+                // Close the writer after the last lease is restored. The next
+                // acquisition starts a new writer; failed restores keep it alive.
                 self.client = None;
             }
         } else {

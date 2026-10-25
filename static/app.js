@@ -1,4 +1,4 @@
-import {interpolate, miniCurve, updateMiniCurve} from './curve.js';
+import {interpolate, miniCurve, updateCardCurve, releaseCardCurve} from './curve.js';
 import {icon, text, attribute, html, spark, updateOutputBar, initFanColumns, formatTime, createCardVisibility} from './ui.js';
 import {createCurvePlot} from './curve-editor.js';
 import {createConfirmation} from './confirm.js';
@@ -21,7 +21,7 @@ let discoverySignature='', librarySignature='', libraryConfig, libraryEditable, 
 let cardConfig,cardSources='',commonCardSignature='';
 let indexedConfig,fanIndex=new Map(),curveIndex=new Map();
 const fanConfigSignatures=new WeakMap();
-const cardVisibility=createCardVisibility(()=>{if(state&&currentTab==='control')renderFanCards();});
+const cardVisibility=createCardVisibility(()=>{if(state&&currentTab==='control')renderFanCards();},releaseCardCurve);
 let lastEditorHeartbeat=0;
 const editable = () => connected && state?.workspace_api===2;
 function indexConfig(){
@@ -112,7 +112,6 @@ function render(){
 function sourceOptions(f){const choices=[...sources,...state.sensors.filter(s=>s.kind==='gpu').map(s=>[s.id,s.name])];const value=f.sensor_ids.length===1&&choices.some(s=>s[0]===f.sensor_ids[0])?f.sensor_ids[0]:'@custom';return choices.map(([id,name])=>`<option value="${esc(id)}" ${id===value?'selected':''}>${esc(name)}</option>`).join('')+`<option value="@custom" ${value==='@custom'?'selected':''}>自定义组合…</option>`;}
 function curveOptions(f,expanded=false){
   const curves=state.config.curves||[];
-  // Large libraries otherwise create fans × curves native option elements.
   // Populate the complete native menu before pointer or keyboard interaction.
   if(!expanded&&curves.length>16){
     if(f.mode==='manual')return '<option value="@manual" selected disabled hidden>曲线</option>';
@@ -142,8 +141,7 @@ function renderFanCards(){
   const ids=new Set(state.config.fans.map(f=>f.id));
   const cards=new Map([...$('fan-cards').children].map(el=>[el.dataset.fan,el]));
   const channels=new Map(state.channels.map(c=>[c.id,c]));
-  // Curves and source labels are shared by all cards. Rebuild their signature
-  // on configuration/source changes, rather than retaining a library per fan.
+  // Refresh the shared curve and source signature on configuration changes.
   const sourceSignature=JSON.stringify(state.sensors.filter(s=>s.kind==='gpu').map(s=>[s.id,s.name]));
   if(cardConfig!==state.config||cardSources!==sourceSignature){
     const next=JSON.stringify([state.config.curves,sourceSignature]);
@@ -169,17 +167,17 @@ function renderFanCards(){
         <div class="fan-values"><div class="output-reading"><strong data-live="actual">—</strong><small>% 输出</small></div><div class="reading"><span data-live="rpm">—</span> RPM<br><span data-live="temperature">—</span> °C 输入</div></div><div class="progress" role="img"><i data-live="progress"></i><span data-output-target hidden></span></div>
         <div class="card-controls"><div class="mode-buttons" role="group" aria-label="${esc(f.name)} 控制方式"><label class="mode-control curve-mode-control ${f.mode==='curve'?'selected':''}" title="曲线模式 · 选择曲线"><select data-field="curve_id" aria-label="${esc(f.name)} 曲线模式与曲线选择" ${disabled?'disabled':''}>${curveOptions(f)}</select></label><button class="mode-choice ${f.mode==='manual'?'selected':''}" data-mode="manual" aria-pressed="${f.mode==='manual'}" ${disabled?'disabled':''}>手动</button></div><label class="mode-control source-mode-control" title="温度源">${icon('activity')}<select data-field="source" aria-label="${esc(f.name)} 温度源" ${disabled?'disabled':''}>${sourceOptions(f)}</select></label></div>
         <div class="manual-field" ${f.mode==='manual'?'':'hidden'}><div class="slider-label"><label for="manual-${esc(f.id)}">手动输出</label><output data-live="manual">${fmt(Math.max(low,Math.min(high,f.manual_duty)))}%</output></div><input id="manual-${esc(f.id)}" data-manual type="range" min="${low}" max="${high}" step="1" value="${Math.max(low,Math.min(high,f.manual_duty))}" aria-label="${esc(f.name)} 手动输出" ${disabled?'disabled':''}><div class="hint">${fmt(low)}–${fmt(high)}% · 手动输出，曲线未使用</div></div>
-        <button class="fan-curve-preview" data-edit-curve aria-label="编辑 ${esc(f.name)} 的曲线" ${disabled?'disabled':''}>${miniCurve(pointsFor(f),true)}</button>
+        <button class="fan-curve-preview" data-edit-curve aria-label="编辑 ${esc(f.name)} 的曲线" ${disabled?'disabled':''}></button>
         <div class="card-footer"><span class="hint" data-live="policy"></span><div class="toolbar">${!f.identified&&c?`<button class="text-button" data-identify="${esc(c.id)}" ${disabled?'disabled':''}>确认设备</button>`:`<button class="text-button" data-edit-curve ${disabled?'disabled':''}>编辑曲线</button>`}<button class="text-button" data-device ${disabled?'disabled':''}>${icon('settings')}设置</button></div></div><p class="card-feedback" data-live="feedback" role="status"></p>`;
       el._live=Object.fromEntries([...el.querySelectorAll('[data-live]')].map(node=>[node.dataset.live,node]));
-      el._curve=el.querySelector('.fan-curve-preview>svg');
+      el._curve=null;
     }
-    if(!cardVisibility.visible(el,ids.size>16)&&!el.contains(document.activeElement))continue;
+    if(!cardVisibility.visible(el,ids.size>16)&&!el.contains(document.activeElement)){releaseCardCurve(el);continue;}
     const live=(key,value)=>{const target=el._live[key];if(target)text(target,value);};
     const status=!connected?'连接中断':testing?'测试辨认中':state.pending_autostart?.[f.id]?'等待设备就绪':o.active?(o.fault?'保护运行':o.automatic?'显卡自动调速':'正在控制'):!f.identified?'待确认设备':c?'未启用控制':f.channel_id?'通道离线':'离线配置';
     el.classList.toggle('is-active',connected&&!!o.active);el.classList.toggle('has-fault',connected&&!!o.active&&!!o.fault);live('status',status);attribute(el._live.status,'class',`status-tag ${connected&&o.active?'active':''} ${connected&&o.fault&&o.active?'fault':''}`);
     live('actual',connected?fmt(o.actual,1):'—');live('rpm',connected?fmt(o.rpm):'—');live('temperature',connected?fmt(o.temperature,1):'—');
-    updateMiniCurve(el._curve,pointsFor(f),connected?o.temperature:null,f.mode);
+    updateCardCurve(el,pointsFor(f),connected?o.temperature:null,f.mode);
     updateOutputBar(el._live.progress.parentElement,connected?o:{});
     live('policy',o.active&&o.automatic?'曲线 0% · 显卡自动调速':requested?(state.background_service?'已保存 · 开机恢复':'本次运行有效'):c?.backend==='nvidia'?(c.mode===0?'显卡自动调速':'显卡原手动模式'):'保持原硬件控制');
     const message=cardMessages.get(f.id);const fault=connected&&o.active?o.fault:null;

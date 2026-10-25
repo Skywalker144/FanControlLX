@@ -9,6 +9,7 @@ mod nvml;
 mod perf_tests;
 mod runtime;
 mod server;
+mod state;
 mod telemetry;
 #[cfg(test)]
 mod tests;
@@ -195,7 +196,7 @@ fn run() -> Result<()> {
         service,
     )?;
     engine.resume();
-    let (controller, client) = runtime::channel(&engine);
+    let (mut controller, client) = runtime::channel(&engine);
     if let Err(e) = server::start(listener, client) {
         let _ = engine.shutdown();
         return Err(e);
