@@ -20,8 +20,6 @@ sudo ./install-service.sh   # 沿用其他系统驱动的机器加 --skip-driver
 
 构建需要 Rust 1.82+ 和 C 链接器；安装 Rust 可参考 [官方安装说明](https://www.rust-lang.org/tools/install)。构建完成后运行不需要 Rust 工具链。首次迁移必须更新服务单元，之后代码或网页更新需重新构建再重启。架构和迁移说明见 [Rust 后台](docs/RUST.md)。
 
-本机升级前后的 CPU、内存和控制周期实测，以及原始数据和复现方法，见 [性能对比](docs/PERFORMANCE.md)。
-
 ## 更新与配置兼容
 
 每台机器使用自己的 `data/config.json`；演示模式使用 `data/config.demo.json`。`data/` 已被 Git 忽略，正常 `git pull` 不会覆盖本机的曲线、名称、通道绑定或控制开关。
@@ -40,11 +38,7 @@ sudo systemctl restart fancontrollx
 
 随后刷新网页。本机和其他机器分别保留各自的配置，不需要相互复制配置、驱动或硬件绑定。代码更新无需重新安装驱动；内核更新仍需按硬件文档重新编译、签名并安装模块。临时前台模式请退出旧进程后重新启动。网页检测到旧后端时会提示重启并禁用配置写入。
 
-前端的一致性、依赖与低资源约定，以及浏览器性能复现方法，见 [前端说明](docs/FRONTEND.md)。后台架构、驱动访问和接口开销的全面检查见 [性能审查](docs/PERFORMANCE_AUDIT.md)。
-
-2026-10-22 的后续优化包括观看页增量传输、共享曲线缓存、紧凑历史和空闲 GPU 写入进程回收；实测与剩余开销见 [资源占用审查](docs/RESOURCE_USAGE.md)。
-
-2026-10-25 进一步将控制策略预解析、输出 JSON 按需生成，并复用 hwmon 采样存储；控制循环、分配次数与测试边界见 [常驻开销优化](docs/PERFORMANCE_2026-10-25.md)。
+前端的一致性、依赖与低资源约定，以及浏览器性能复现方法，见 [前端说明](docs/FRONTEND.md)。后台架构、驱动访问和接口说明见 [Rust 后台](docs/RUST.md)。
 
 ## 日常操作
 
