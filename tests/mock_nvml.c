@@ -34,13 +34,16 @@ const char *nvmlErrorString(int code) { (void)code; return "mock driver failure"
 int nvmlDeviceGetCount_v2(unsigned *v) {
     char p[4096]; path(p, "enumerations"); FILE *f = fopen(p, "a");
     if (f) { fputs("scan\n", f); fclose(f); }
-    *v = 1; return 0;
+    path(p, "gpu-hidden"); *v = access(p, F_OK) == 0 ? 0 : 1; return 0;
 }
 int nvmlDeviceGetHandleByIndex_v2(unsigned i, void **h) { if (i) return 999; *h = (void *)1; return 0; }
 int nvmlDeviceGetHandleByUUID(const char *uuid, void **h) { if (strcmp(uuid,"GPU-abcd")) return 999; *h=(void *)1; return 0; }
 int nvmlDeviceGetUUID(void *h, char *s, unsigned n) { (void)h; snprintf(s,n,"GPU-abcd"); return 0; }
 int nvmlDeviceGetName(void *h, char *s, unsigned n) { (void)h; snprintf(s,n,"Mock GPU"); return 0; }
-int nvmlDeviceGetNumFans(void *h, unsigned *v) { (void)h; *v=1; return 0; }
+int nvmlDeviceGetNumFans(void *h, unsigned *v) {
+    (void)h; char p[4096]; path(p,"fan-count"); FILE *f=fopen(p,"r"); *v=1;
+    if(f){if(fscanf(f,"%u",v)!=1)abort();fclose(f);} return 0;
+}
 int nvmlDeviceGetMinMaxFanSpeed(void *h, unsigned *min, unsigned *max) { (void)h; *min=30; *max=100; return 0; }
 int nvmlDeviceGetTemperature(void *h, unsigned sensor, unsigned *v) {
     (void)h; (void)sensor; char p[4096]; path(p,"stall-read");
