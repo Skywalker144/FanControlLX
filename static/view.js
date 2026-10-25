@@ -1,11 +1,12 @@
 import {miniCurve, updateMiniCurve} from './curve.js';
-import {icon, text, attribute, spark, updateOutputBar, initFanColumns, formatTime} from './ui.js';
+import {icon, text, attribute, spark, updateOutputBar, initFanColumns, formatTime, createCardVisibility} from './ui.js';
 
 const $=id=>document.getElementById(id);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const numberFormat=new Intl.NumberFormat('zh-CN',{maximumFractionDigits:1});
 const fmt=v=>v==null?'—':numberFormat.format(Number(v));
 let state,connected=false,timer,generation=0,sequence=0,applied=0;
+const cardVisibility=createCardVisibility(render);
 initFanColumns($('fan-columns'),$('fan-cards'));
 function render(){
   $('connection-error').hidden=connected;
@@ -24,7 +25,7 @@ function render(){
   text($('service-error'),state.error||'');
   const cards=new Map([...$('fan-cards').children].map(card=>[card.dataset.fan,card]));
   const ids=new Set(state.fans.map(f=>f.id));
-  for(const [id,card] of cards)if(!ids.has(id)){card.remove();cards.delete(id);}
+  for(const [id,card] of cards)if(!ids.has(id)){cardVisibility.remove(card);card.remove();cards.delete(id);}
   for(const [index,f] of state.fans.entries()){
     let card=cards.get(f.id);
     if(!card){card=document.createElement('article');card.className='fan-card view-card';card.dataset.fan=f.id;$('fan-cards').append(card);}
@@ -37,6 +38,8 @@ function render(){
       card._live=Object.fromEntries([...card.querySelectorAll('[data-live]')].map(el=>[el.dataset.live,el]));
       card._curve=card.querySelector('.fan-curve-preview>svg');
     }
+    if($('fan-cards').children[index]!==card)$('fan-cards').insertBefore(card,$('fan-cards').children[index]||null);
+    if(!cardVisibility.visible(card,ids.size>16))continue;
     const o=f.output||{},live=card._live,value=k=>fmt(connected?o[k]:null);
     const active=connected&&!!o.active,fault=active&&!!o.fault;
     card.classList.toggle('is-active',active);card.classList.toggle('has-fault',fault);
@@ -47,7 +50,6 @@ function render(){
     const message=connected?(o.fault||f.pending||''):'';
     text(live.fault,message);if(live.fault.hidden!==!message)live.fault.hidden=!message;
     updateMiniCurve(card._curve,f.points,connected?o.temperature:null,f.mode);
-    if($('fan-cards').children[index]!==card)$('fan-cards').insertBefore(card,$('fan-cards').children[index]||null);
   }
   text($('last-update'),connected?`采样于 ${formatTime(state.sample_time)}`:'读数已过期');
 }
