@@ -22,6 +22,7 @@ pub struct Snapshot {
     // Globally unique discovery generation; a snapshot from another source
     // cannot accidentally reuse this source's topology.
     pub(crate) hwmon_generation: u64,
+    pub(crate) gpu_generation: u64,
 }
 pub trait Hardware: Send {
     fn sample(&mut self, force: bool) -> Result<Snapshot>;
@@ -118,6 +119,8 @@ struct Channel {
 }
 struct GpuEntry {
     device: Device,
+    sensor: Value,
+    chip: Value,
     channels: Vec<Value>,
 }
 pub struct Real {
@@ -133,6 +136,7 @@ pub struct Real {
     generation: u64,
     nvml: Option<Nvml>,
     gpu_entries: Vec<GpuEntry>,
+    gpu_generation: u64,
     gpu_at: Option<Instant>,
     gpu_invalidated: bool,
     gpu_retry: Instant,
@@ -164,6 +168,7 @@ impl Real {
             generation: 0,
             nvml: None,
             gpu_entries: vec![],
+            gpu_generation: 0,
             gpu_at: None,
             gpu_invalidated: false,
             gpu_retry: Instant::now(),
@@ -284,6 +289,7 @@ impl Real {
             }
         }
         let Some(n) = self.nvml.as_mut() else {
+            self.clear_gpu(s);
             self.fallback_gpu(s);
             return;
         };
@@ -325,43 +331,101 @@ impl Real {
                         }
                         Err(e) => self.control_error = Some(e.1),
                     }
-                    metadata.push(GpuEntry { device, channels });
+                    let sid = format!("nvidia/{}", device.uuid);
+                    let sensor = json!({"id":sid,"name":device.name,"chip":"nvidia","kind":"gpu","value":null});
+                    let chip = json!({"id":sid,"name":device.name,"path":"NVML"});
+                    metadata.push(GpuEntry {
+                        device,
+                        sensor,
+                        chip,
+                        channels,
+                    });
                 }
                 self.gpu_entries = metadata;
+                static GENERATION: AtomicU64 = AtomicU64::new(1);
+                self.gpu_generation = GENERATION.fetch_add(1, Ordering::Relaxed);
                 self.gpu_at = Some(Instant::now());
                 self.gpu_invalidated = false;
             }
+            if s.gpu_generation != self.gpu_generation {
+                s.sensors.truncate(self.sensors.len());
+                s.fans.truncate(self.fans.len());
+                s.channels.truncate(self.channel_order.len());
+                s.chips.truncate(self.chips.len());
+                for entry in &self.gpu_entries {
+                    s.sensors.push(entry.sensor.clone());
+                    s.chips.push(entry.chip.clone());
+                    for meta in &entry.channels {
+                        let mut channel = meta.clone();
+                        channel.as_object_mut().unwrap().remove("index");
+                        s.fans
+                            .push(json!({"id":channel["rpm_sensor_id"],"name":channel["name"],
+                            "chip":"nvidia","rpm":null,"rpm_is_feedback":false}));
+                        s.channels.push(channel);
+                    }
+                }
+                s.gpu_generation = self.gpu_generation;
+            }
             let mut temp_error = false;
-            let mut errors = vec![];
-            for entry in &self.gpu_entries {
+            // Permission/driver diagnostics often stay identical for hours.
+            // Reuse their String as well as the telemetry objects.
+            let mut errors = if self.gpu_entries.is_empty() {
+                String::new()
+            } else {
+                self.control_error.take().unwrap_or_default()
+            };
+            errors.clear();
+            let mut fan_index = self.fans.len();
+            let mut channel_index = self.channel_order.len();
+            for (device_index, entry) in self.gpu_entries.iter().enumerate() {
                 let d = &entry.device;
                 let temp = n.temperature(d.handle).ok();
                 temp_error |= temp.is_none();
-                let sid = format!("nvidia/{}", d.uuid);
-                s.sensors.push(
-                    json!({"id":sid,"name":d.name,"chip":"nvidia","kind":"gpu","value":temp}),
+                update_field(
+                    &mut s.sensors[self.sensors.len() + device_index],
+                    "value",
+                    json!(temp),
                 );
-                s.chips.push(json!({"id":sid,"name":d.name,"path":"NVML"}));
                 for meta in &entry.channels {
                     let index = meta["index"].as_u64().unwrap() as u32;
-                    let mut c = meta.clone();
-                    c.as_object_mut().unwrap().remove("index");
+                    let c = &mut s.channels[channel_index];
                     let policy = n.fan_uint(b"nvmlDeviceGetFanControlPolicy_v2\0", d.handle, index);
                     let duty = n.fan_uint(b"nvmlDeviceGetFanSpeed_v2\0", d.handle, index);
-                    if policy.is_err() || duty.is_err() {
-                        c["writable"] = json!(false);
-                        c["reason"] = json!("NVIDIA 读数不可用");
-                        // Keep the discovery timestamp so a read failure cannot
-                        // turn the 30-second retry into enumeration every tick.
-                        self.gpu_invalidated = true;
+                    let failed = policy.is_err() || duty.is_err();
+                    let reason = if failed {
+                        "NVIDIA 读数不可用"
+                    } else {
+                        text(&meta["reason"])
+                    };
+                    update_field(c, "writable", json!(!failed && yes(&meta["writable"])));
+                    if text(&c["reason"]) != reason {
+                        update_field(
+                            c,
+                            "reason",
+                            if failed {
+                                json!(reason)
+                            } else {
+                                meta["reason"].clone()
+                            },
+                        );
                     }
-                    c["mode"] = json!(policy.ok());
-                    c["duty"] = json!(duty.ok());
-                    if let Some(e) = c["reason"].as_str() {
-                        errors.push(e.to_owned());
+                    // Do not let a read error bypass the discovery backoff.
+                    self.gpu_invalidated |= failed;
+                    update_field(c, "mode", json!(policy.ok()));
+                    update_field(c, "duty", json!(duty.ok()));
+                    if !reason.is_empty() {
+                        if !errors.is_empty() {
+                            errors.push('；');
+                        }
+                        errors.push_str(reason);
                     }
-                    s.fans.push(json!({"id":c["rpm_sensor_id"],"name":c["name"],"chip":"nvidia","rpm":n.rpm(d.handle,index).ok(),"rpm_is_feedback":false}));
-                    s.channels.push(c);
+                    update_field(
+                        &mut s.fans[fan_index],
+                        "rpm",
+                        json!(n.rpm(d.handle, index).ok()),
+                    );
+                    fan_index += 1;
+                    channel_index += 1;
                 }
             }
             self.gpu_error = if temp_error {
@@ -369,12 +433,13 @@ impl Real {
             } else {
                 None
             };
-            if !errors.is_empty() {
-                self.control_error = Some(errors.join("；"));
+            let control_failed = !errors.is_empty();
+            if control_failed {
+                self.control_error = Some(errors);
             } else if !self.gpu_entries.is_empty() {
                 self.control_error = None;
             }
-            self.gpu_invalidated |= temp_error || !errors.is_empty();
+            self.gpu_invalidated |= temp_error || control_failed;
             Ok(())
         })();
         if let Err(e) = sample {
@@ -383,10 +448,19 @@ impl Real {
             self.nvml = None;
             self.gpu_entries.clear();
             self.gpu_retry = Instant::now() + Duration::from_secs(10);
+            self.clear_gpu(s);
         }
         if !s.sensors.iter().any(|v| v["kind"] == "gpu") {
+            self.clear_gpu(s);
             self.fallback_gpu(s);
         }
+    }
+    fn clear_gpu(&self, s: &mut Snapshot) {
+        s.sensors.truncate(self.sensors.len());
+        s.fans.truncate(self.fans.len());
+        s.channels.truncate(self.channel_order.len());
+        s.chips.truncate(self.chips.len());
+        s.gpu_generation = 0;
     }
     fn fallback_gpu(&mut self, s: &mut Snapshot) {
         // Compatibility fallback only. Never fork nvidia-smi on the normal NVML
@@ -497,13 +571,7 @@ impl Hardware for Real {
                 .collect();
             s.chips.clone_from(&self.chips);
             s.hwmon_generation = self.generation;
-        } else {
-            // Drop last cycle's GPU rows before appending fresh GPU telemetry.
-            // hwmon objects and their field/name allocations remain in place.
-            s.sensors.truncate(self.sensors.len());
-            s.fans.truncate(self.fans.len());
-            s.channels.truncate(self.channel_order.len());
-            s.chips.truncate(self.chips.len());
+            s.gpu_generation = 0;
         }
         let mut stale = false;
         for (r, m) in self.sensors.iter().zip(&mut s.sensors) {
@@ -862,6 +930,23 @@ mod cache_tests {
         assert!(!yes(&c["writable"]));
         assert!(h.acquire(text(&c["id"]), 50.).is_err());
         assert_eq!(fs::read_to_string(chip.join("pwm1")).unwrap(), "100");
+    }
+
+    #[test]
+    #[ignore = "requires tests/mock_nvml.c via LD_LIBRARY_PATH and FANCONTROLLX_MOCK_DIR"]
+    fn benchmark_mock_nvml_sampling() {
+        if std::env::var_os("FANCONTROLLX_MOCK_DIR").is_none() {
+            eprintln!("Skipped: provide the isolated mock NVML library and directory");
+            return;
+        }
+        let t = Temp::new();
+        let mut h = Real::with_root(t.0.clone(), None);
+        let mut s = h.sample(true).unwrap();
+        assert!(s.sensors.iter().any(|row| row["name"] == "Mock GPU"));
+        crate::perf_tests::measure("mock_nvml_reused_snapshot", 10000, || {
+            h.sample_into(false, &mut s).unwrap();
+            std::hint::black_box(&s);
+        });
     }
 
     #[test]
