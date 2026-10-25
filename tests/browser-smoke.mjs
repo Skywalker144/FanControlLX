@@ -11,7 +11,7 @@ const browserPath=process.env.CHROME_BIN;
 if(!browserPath)throw new Error('Set CHROME_BIN to an existing Chromium executable');
 const snapshotOnly=process.argv.includes('--snapshot-only');
 const profile=await mkdtemp(join(tmpdir(),'fancontrollx-browser-'));
-const browser=spawn(browserPath,['--headless','--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--remote-debugging-port=0',`--user-data-dir=${profile}`,'about:blank'],{stdio:['ignore','ignore','pipe']});
+const browser=spawn(browserPath,['--headless','--no-sandbox','--no-first-run','--no-default-browser-check','--password-store=basic','--use-mock-keychain','--disable-background-networking','--disable-component-update','--disable-sync','--disable-dev-shm-usage','--disable-gpu','--remote-debugging-port=0',`--user-data-dir=${profile}`,'about:blank'],{stdio:['ignore','ignore','pipe']});
 let socket;
 try{
   const endpoint=await new Promise((resolve,reject)=>{
@@ -21,7 +21,7 @@ try{
   });
   socket=new WebSocket(endpoint);
   await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});
-  let next=0,session;const pending=new Map(),errors=[],requests=[];
+  let next=0,session;const pending=new Map(),errors=[],requests=[],pausedModules=[];
   const send=(method,params={},sessionId=session)=>new Promise((resolve,reject)=>{
     const id=++next;const timer=setTimeout(()=>{pending.delete(id);reject(new Error(`${method} timed out`));},12000);
     pending.set(id,{resolve,reject,timer});socket.send(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})}));
@@ -31,11 +31,12 @@ try{
     if(value.id){const p=pending.get(value.id);if(p){clearTimeout(p.timer);pending.delete(value.id);value.error?p.reject(new Error(JSON.stringify(value.error))):p.resolve(value.result);}}
     if(value.method==='Runtime.exceptionThrown')errors.push(value.params.exceptionDetails.text+': '+(value.params.exceptionDetails.exception?.description||''));
     if(value.method==='Network.requestWillBeSent')requests.push(value.params.request);
+    if(value.method==='Fetch.requestPaused')pausedModules.push(value.params.requestId);
     if(value.method==='Page.javascriptDialogOpening')send('Page.handleJavaScriptDialog',{accept:true}).catch(()=>{});
   });
   const target=await send('Target.createTarget',{url:'about:blank'},null);
   session=(await send('Target.attachToTarget',{targetId:target.targetId,flatten:true},null)).sessionId;
-  await send('Page.enable');await send('Runtime.enable');await send('Network.enable');
+  await send('Page.enable');await send('Runtime.enable');await send('Network.enable');await send('Page.bringToFront');
   await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
   await send('Page.navigate',{url:new URL('/',url).href});
   const evaluate=async expression=>{
@@ -71,28 +72,63 @@ try{
   };
   await waitFor('document.getElementById("connection-text")?.textContent.includes("已连接")');
   assert.equal(await evaluate('!!document.querySelector("#edit-link")'),true,'Default page is the viewer');
-  assert.equal(await evaluate('document.querySelectorAll("input,select,dialog").length'),0,'Viewer contains no editor controls');
+  assert.equal(await evaluate('document.querySelectorAll("input,select:not(#theme-select):not(#fan-columns),dialog").length'),0,'Viewer contains no editor controls');
+  assert.equal(await evaluate(`document.getElementById('theme-select').value`),'system','Theme defaults to following the device');
   assert.equal(await evaluate(`document.querySelectorAll('.fan-curve-preview>svg').length===document.querySelectorAll('[data-fan]').length && document.querySelectorAll('[data-fan]').length>0`),true,'Every viewer fan has a curve');
   assert.equal(await evaluate(`document.querySelectorAll('[data-fan] button,[data-fan] a,[data-fan] [tabindex],[data-fan] [draggable]').length`),0,'Viewer fan cards have no editing or drag controls');
-  assert.equal(await evaluate(`(async()=>{const view=await(await fetch('/api/view')).json();return view.fans.every(f=>{const svg=Array.from(document.querySelectorAll('[data-fan]')).find(c=>c.dataset.fan===f.id).querySelector('.fan-curve-preview>svg');return svg.querySelectorAll(':scope>circle').length===f.points.length&&svg.querySelector('[data-curve-current]').getAttribute('visibility')===(Number.isFinite(f.output?.temperature)?'visible':'hidden')})})()`),true,'Viewer curves show configured nodes and available temperature markers');
+  assert.equal(await evaluate(`(async()=>{const view=await(await fetch('/api/view')).json();return view.fans.every(f=>{const svg=Array.from(document.querySelectorAll('[data-fan]')).find(c=>c.dataset.fan===f.id).querySelector('.fan-curve-preview>svg');return svg.querySelectorAll(':scope>circle').length===f.points.filter(p=>p[0]>=20&&p[0]<=100).length&&svg.querySelector('[data-curve-current]').getAttribute('visibility')===(Number.isFinite(f.output?.temperature)?'visible':'hidden')})})()`),true,'Viewer curves show configured nodes and available temperature markers');
+  assert.equal(await evaluate(`['cpu','gpu'].every(kind=>document.querySelector('#'+kind+'-spark path')?.getAttribute('d').includes('M'))`),true,'Viewer displays cached CPU and GPU temperature history');
+  const chooseColumns=columns=>evaluate(`(()=>{const select=document.getElementById('fan-columns');select.value=${JSON.stringify(columns)};select.dispatchEvent(new Event('change'))})()`);
+  const renderedColumns=()=>evaluate(`getComputedStyle(document.getElementById('fan-cards')).gridTemplateColumns.split(' ').length`);
+  for(const columns of ['1','2','3','4']){
+    await chooseColumns(columns);
+    assert.equal(await renderedColumns(),Number(columns),'Viewer applies selected column count');
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'),true,`Viewer overflow with ${columns} columns`);
+  }
+  await reloadPage();
+  await waitFor(`document.getElementById('connection-text')?.textContent.includes('已连接')`);
+  assert.equal(await evaluate(`document.getElementById('fan-columns').value`),'4','Column preference survives reload');
   await mkdir('test-results',{recursive:true});
-  for(const width of [1440,320]){
+  for(const width of [1920,1440,320]){
     await send('Emulation.setDeviceMetricsOverride',{width,height:1100,deviceScaleFactor:1,mobile:false});
     assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'),true,`Viewer overflow at ${width}px`);
+    if(width===320)assert.equal(await renderedColumns(),1,'Mobile uses one readable column');
+    assert.equal(await evaluate(`Array.from(document.querySelectorAll('.view-card')).filter(card=>card.querySelector('[data-live="fault"]').hidden).every(card=>{const tick=card.querySelector('.fan-curve-preview>svg>g:last-child text'),gap=card.getBoundingClientRect().bottom-tick.getBoundingClientRect().bottom;return gap<=14&&parseFloat(getComputedStyle(card).paddingLeft)===12})`),true,`Viewer temperature ticks stay close to the card edge at ${width}px`);
     const shot=await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});
     await writeFile(`test-results/viewer-${width}.png`,Buffer.from(shot.data,'base64'));
   }
-  await evaluate(`(async()=>{window.originalViewerFetch=window.fetch;window.mockViewerState=await(await fetch('/api/view')).json();window.fetch=(...args)=>String(args[0])==='/api/view'?Promise.resolve(new Response(JSON.stringify(window.mockViewerState))):window.originalViewerFetch(...args);const f=window.mockViewerState.fans[0];f.mode='manual';f.points=[[20,10],[60,80]];f.output={...f.output,temperature:40};document.getElementById('retry').click()})()`);
-  await waitFor(`document.querySelector('.fan-curve-preview').textContent.includes('手动模式，曲线未使用')`);
+  await evaluate(`(async()=>{window.originalViewerFetch=window.fetch;window.mockViewerState=await(await fetch('/api/view')).json();window.mockViewerState.view_revision='test-fixture';window.fetch=(...args)=>String(args[0]).split('?')[0]==='/api/view'?Promise.resolve(new Response(JSON.stringify(window.mockViewerState))):window.originalViewerFetch(...args);const f=window.mockViewerState.fans[0];f.mode='manual';f.points=[[20,10],[60,80]];f.output={...f.output,temperature:40};document.getElementById('retry').click()})()`);
+  await waitFor(`document.querySelector('.card-name .chip-label').textContent.includes('手动模式')`);
   assert.equal(await evaluate(`document.querySelector('.fan-curve-preview>svg').getAttribute('aria-label').includes('曲线参考输出 45%')`),true,'Manual mode labels the curve as a reference');
-  await evaluate(`window.__viewerCurve=document.querySelector('.fan-curve-preview>svg');window.mockViewerState.fans[0].output.actual=53;document.getElementById('retry').click()`);
+  await evaluate(`window.__viewerCurve=document.querySelector('.fan-curve-preview>svg');Object.assign(window.mockViewerState.fans[0].output,{actual:53,target:65,requested:80,automatic:false});document.getElementById('retry').click()`);
   await waitFor(`document.querySelector('[data-live="actual"]').textContent==='53'`);
   assert.equal(await evaluate(`window.__viewerCurve===document.querySelector('.fan-curve-preview>svg')`),true,'Telemetry preserves viewer curve nodes');
+  await evaluate(`(()=>{
+    window.__spark=document.querySelector('#cpu-spark path');
+    const snapshot=structuredClone(window.mockViewerState);
+    snapshot.fans_delta=true;snapshot.history_delta=true;snapshot.history_cursor++;
+    snapshot.history=[{time:snapshot.sample_time+1,cpu:61,gpu:42}];
+    snapshot.fans=snapshot.fans.map(f=>({id:f.id,output:{...f.output,actual:54},pending:f.pending}));
+    window.fetch=(...args)=>String(args[0]).split('?')[0]==='/api/view'?Promise.resolve(new Response(JSON.stringify(snapshot))):window.originalViewerFetch(...args);
+    document.getElementById('retry').click();
+  })()`);
+  await waitFor(`document.querySelector('[data-live="actual"]').textContent==='54'`);
+  assert.equal(await evaluate(`window.__viewerCurve===document.querySelector('.fan-curve-preview>svg') && window.__spark===document.querySelector('#cpu-spark path') && document.querySelector('.card-name .chip-label').textContent.includes('手动模式')`),true,'Incremental telemetry preserves configuration, curve and history nodes');
+  await evaluate(`window.fetch=(...args)=>String(args[0]).split('?')[0]==='/api/view'?Promise.resolve(new Response(JSON.stringify(window.mockViewerState))):window.originalViewerFetch(...args);document.getElementById('retry').click()`);
+  await waitFor(`document.querySelector('[data-live="actual"]').textContent==='53'`);
+  assert.deepEqual(await evaluate(`(()=>{const card=document.querySelector('[data-fan]'),svg=card.querySelector('.fan-curve-preview>svg'),marker=svg.querySelector('[data-curve-current]'),line=marker.querySelector('line');return{target:card.querySelector('[data-output-target]').style.left,pointY:Number(marker.querySelector('circle').getAttribute('cy')),line:[...['x1','x2','y1','y2'].map(key=>Number(line.getAttribute(key)))],markerTransform:marker.getAttribute('transform'),lines:marker.querySelectorAll('line').length,noTargetPoint:!svg.querySelector('[data-curve-target]'),labelRemoved:!card.querySelector('.value-label'),countRemoved:!card.querySelector('.fan-curve-preview').textContent.includes('个节点'),border:getComputedStyle(card.querySelector('.fan-curve-preview')).borderWidth}})()`),{target:'80%',pointY:64-45*.52,line:[0,0,64,64-45*.52],markerTransform:`translate(${12+20/80*236} 0)`,lines:1,noTargetPoint:true,labelRemoved:true,countRemoved:true,border:'0px'},'A single temperature line ends at the interpolated curve point independently of actual and requested output');
+  for(const target of [0,100]){
+    await evaluate(`window.mockViewerState.fans[0].output.requested=${target};document.getElementById('retry').click()`);
+    await waitFor(`document.querySelector('[data-output-target]').style.left==='${target}%'`);
+  }
+  await evaluate(`window.mockViewerState.fans[0].output.automatic=true;document.getElementById('retry').click()`);
+  await waitFor(`document.querySelector('[data-output-target]').hidden && document.querySelector('[data-curve-current]').getAttribute('visibility')==='visible'`);
   await evaluate(`window.mockViewerState.fans[0].output.temperature=null;document.getElementById('retry').click()`);
   await waitFor(`document.querySelector('[data-curve-current]').getAttribute('visibility')==='hidden'`);
   await evaluate(`window.fetch=()=>Promise.reject(new Error('simulated disconnect'));document.getElementById('retry').click()`);
   await waitFor(`!document.getElementById('connection-error').hidden`);
   assert.equal(await evaluate(`Array.from(document.querySelectorAll('[data-curve-current]')).every(m=>m.getAttribute('visibility')==='hidden')`),true,'Disconnected viewer hides all current markers');
+  assert.equal(await evaluate(`Array.from(document.querySelectorAll('[data-output-target]')).every(m=>m.hidden)&&!document.querySelector('[data-curve-target]')`),true,'Disconnected viewer hides bar targets and curves contain no target points');
   assert.equal(await evaluate(`document.querySelectorAll('.fan-curve-preview>svg').length===window.mockViewerState.fans.length`),true,'Disconnected viewer keeps configured curves');
   await evaluate(`window.fetch=window.originalViewerFetch;document.getElementById('retry').click()`);
   await waitFor(`document.getElementById('connection-error').hidden`);
@@ -106,12 +142,20 @@ try{
   await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
   await send('Page.navigate',{url:new URL('/edit',url).href});
   await waitFor('document.getElementById("connection-text")?.textContent.includes("已连接") && document.querySelector("#curve-dialog")');
+  assert.equal(await evaluate(`document.getElementById('fan-columns').value`),'4','Editor shares the viewer column preference');
+  for(const columns of ['1','2','3','4']){
+    await chooseColumns(columns);
+    assert.equal(await renderedColumns(),Number(columns),'Editor applies selected column count');
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'),true,`Editor overflow with ${columns} columns`);
+  }
+  await chooseColumns('auto');
   assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'),true,'Desktop overflow');
   if(!snapshotOnly){
     assert.equal(await evaluate('(async()=>{const s=await(await fetch("/api/state")).json();return s.demo&&s.workspace_api===2})()'),true,'Mutations require the new demo backend');
     await evaluate(`(async()=>{const s=await(await fetch('/api/state')).json();for(const [path,body] of [['/api/config',{version:2,fans:[],curves:[]}],['/api/scan',{}]]){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-FanControl-Token':s.csrf_token},body:JSON.stringify(body)});if(!r.ok)throw new Error(await r.text());}})()`);
     await reloadPage();
     await waitFor('document.querySelectorAll("[data-fan]").length===3');
+    assert.equal(await evaluate(`Array.from(document.querySelectorAll('[data-fan]')).every(card=>{const feedback=card.querySelector('.card-feedback'),footer=card.querySelector('.card-footer');return feedback.textContent===''&&getComputedStyle(feedback).display==='none'&&footer.getBoundingClientRect().height<=36&&!card.querySelector('.preview-caption')})`),true,'Idle editor cards have a compact footer and no reserved feedback space');
     await evaluate(`document.querySelector('[data-create-curve]').click()`);
     await waitFor('document.getElementById("curve-dialog").open');
     assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll('[data-point][data-axis="0"]')).map(el=>[Number(el.value),Number(document.querySelector('[data-point="'+el.dataset.point+'"][data-axis="1"]').value)])`),[[30,20],[50,50],[80,100]]);
@@ -174,12 +218,20 @@ try{
     const initialPoints=JSON.stringify((await saved()).fans[0].points);
     await evaluate(`${card(first)}.querySelector('[data-edit-curve]').click()`);
     await waitFor('document.getElementById("curve-dialog").open');
+    assert.equal(await evaluate(`(()=>{const marker=document.querySelector('#curve-chart [data-plot-current]'),line=marker.querySelector('line');return marker.querySelectorAll('line').length===1&&line.getAttribute('x1')===line.getAttribute('x2')&&line.getAttribute('y2')===marker.querySelector('circle').getAttribute('cy')&&Number(line.getAttribute('y1'))>=Number(line.getAttribute('y2'))})()`),true,'The curve editor temperature line also stops at its curve intersection');
     assert.equal(await evaluate(`${card(first)}.querySelector('[data-edit-curve] svg[role="img"]')!==null`),true,'Card thumbnail opens curve editor');
     assert.equal(await evaluate(`${card(first)}.querySelector('.card-top [data-toggle]')!==null`),true,'Control toggle is in card header');
-    assert.equal(await evaluate(`${card(first)}.querySelector('.fan-values [data-live="target"]')!==null`),true,'Target stays next to actual output');
+    assert.equal(await evaluate(`${card(first)}.querySelector('.progress [data-output-target]')!==null && !${card(first)}.querySelector('.value-label')`),true,'Target is represented on the output bar');
     await evaluate(`document.getElementById('preset').value='quiet';document.getElementById('preset').dispatchEvent(new Event('change'))`);
     assert.equal(await evaluate(`document.querySelectorAll('#point-list .point').length`),5,'All nodes are listed together');
     assert.equal(await evaluate(`document.querySelector('.point-pagination')===null`),true,'Node pagination is removed');
+    assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll('[data-point][data-axis="0"]')).map(el=>[el.min,el.max])`),Array(5).fill(['20','100']),'Temperature inputs use the fixed range');
+    await evaluate(`(()=>{for(const [index,value] of [[0,0],[4,120]]){const input=document.querySelector('[data-point="'+index+'"][data-axis="0"]');input.value=value;input.dispatchEvent(new Event('change',{bubbles:true}))}})()`);
+    assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll('[data-point][data-axis="0"]')).map(el=>Number(el.value))`),[20,45,60,75,100],'Typing clamps temperatures to 20–100°C');
+    assert.equal(await evaluate(`Array.from(document.querySelectorAll('#curve-chart text')).filter(el=>el.textContent.endsWith('°')).map(el=>el.textContent).join(',')`),'20°,30°,40°,50°,60°,70°,80°,90°,100°','Editing always retains the fixed temperature axis');
+    await evaluate(`document.querySelector('#curve-chart [data-node="0"]').focus()`);
+    await send('Input.dispatchKeyEvent',{type:'keyDown',key:'ArrowLeft',code:'ArrowLeft'});
+    assert.equal(await evaluate(`document.querySelector('[data-point="0"][data-axis="0"]').value`),'20','Keyboard movement respects the left boundary');
     await evaluate(`window.__plotNode=document.querySelector('#curve-chart [data-node="2"]');window.__plotNode.focus({preventScroll:true})`);
     await new Promise(resolve=>setTimeout(resolve,1800));
     assert.equal(await evaluate(`window.__plotNode===document.querySelector('#curve-chart [data-node="2"]')&&document.activeElement===window.__plotNode`),true,'Polling preserves curve nodes and keyboard focus');
@@ -296,6 +348,51 @@ try{
     await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
     await confirmAction();
     await post('/api/curve/delete',{id:many.id});
+    // Navigation is addressable and follows browser history, including reloads.
+    await evaluate(`document.querySelector('nav [data-tab="devices"]').click();document.querySelector('nav [data-tab="sensors"]').click();history.back()`);
+    await waitFor(`document.querySelector('nav [aria-current="page"]').dataset.tab==='devices'`);
+    await evaluate('history.forward()');
+    await waitFor(`document.querySelector('nav [aria-current="page"]').dataset.tab==='sensors'`);
+    await reloadPage();
+    await waitFor(`document.getElementById('connection-text').textContent.includes('已连接')`);
+    assert.equal(await evaluate(`!document.getElementById('tab-sensors').hidden&&document.title.startsWith('硬件传感器')`),true,'Reload retains the selected page and document title');
+    await evaluate(`document.querySelector('nav [data-tab="control"]').click();const source=${card(first)}.querySelector('[data-field="source"]');source.focus();source.dispatchEvent(new Event('change',{bubbles:true}))`);
+    await waitFor(`${card(first)}.querySelector('[data-field="source"]').disabled===false`);
+    assert.equal(await evaluate(`document.activeElement===${card(first)}.querySelector('[data-field="source"]')`),true,'Automatic save restores keyboard focus');
+
+    await evaluate(`document.getElementById('new-curve').click();document.getElementById('curve-name').value='键盘保存回归';window.__pointInput=document.querySelector('[data-point="0"][data-axis="0"]');window.__pointInput.focus();window.__pointInput.select()`);
+    await send('Input.insertText',{text:'31'});
+    await send('Input.dispatchKeyEvent',{type:'keyDown',key:'Tab',code:'Tab'});
+    await send('Input.dispatchKeyEvent',{type:'keyUp',key:'Tab',code:'Tab'});
+    assert.equal(await evaluate(`window.__pointInput===document.querySelector('[data-point="0"][data-axis="0"]')&&document.activeElement.matches('[data-point="0"][data-axis="1"]')`),true,'Editing a node preserves its input and natural Tab order');
+    await evaluate(`window.__pointInput.focus();window.__pointInput.select()`);
+    await send('Input.insertText',{text:'32'});
+    await evaluate(`window.__uxFetch=window.fetch;window.__saveCalls=0;window.fetch=(url,...args)=>String(url)==='/api/curve'?(window.__saveCalls++,new Promise(resolve=>window.__finishSave=resolve)):window.__uxFetch(url,...args)`);
+    await send('Input.dispatchKeyEvent',{type:'keyDown',key:'s',code:'KeyS',modifiers:2});
+    await send('Input.dispatchKeyEvent',{type:'keyUp',key:'s',code:'KeyS'});
+    await waitFor(`typeof window.__finishSave==='function'`);
+    assert.equal(await evaluate(`document.getElementById('curve-dialog').getAttribute('aria-busy')==='true'&&document.getElementById('save-curve').textContent.includes('正在保存')&&Array.from(document.querySelectorAll('#curve-dialog button,#curve-dialog input,#curve-dialog select')).every(el=>el.disabled)`),true,'Pending save locks all form edits and shows progress');
+    await evaluate(`document.getElementById('curve-form').requestSubmit();document.querySelector('#curve-chart [data-node="0"]').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true}));window.__finishSave(new Response(JSON.stringify({error:'模拟保存失败，草稿保留'}),{status:409}))`);
+    await waitFor(`!document.getElementById('save-curve').disabled`);
+    assert.equal(await evaluate('window.__saveCalls'),1,'Repeated save does not submit a second request');
+    assert.equal(await evaluate(`document.querySelector('[data-point="0"][data-axis="0"]').value`),'32','Ctrl+S commits the focused number before saving and locks the graph');
+    assert.equal(await evaluate(`document.getElementById('curve-dialog').open&&!document.getElementById('curve-error').hidden&&!document.getElementById('curve-name').disabled`),true,'Failure keeps the draft open and editable');
+    await evaluate(`window.fetch=(url,...args)=>String(url).startsWith('/api/state')?Promise.reject(new Error('模拟断线')):window.__uxFetch(url,...args);document.getElementById('retry').click()`);
+    await waitFor(`document.getElementById('save-curve').disabled`);
+    assert.equal(await evaluate(`!document.querySelector('#curve-dialog [data-connection-status]').hidden&&document.getElementById('curve-name').value==='键盘保存回归'`),true,'Disconnection explains why saving is disabled without discarding the draft');
+    await evaluate(`window.fetch=window.__uxFetch;document.getElementById('retry').click()`);
+    await waitFor(`!document.getElementById('save-curve').disabled`);
+    await evaluate(`document.querySelector('#curve-dialog [data-close]').click()`);
+    await waitFor(`document.getElementById('confirm-dialog').open`);
+    await send('Input.dispatchKeyEvent',{type:'keyDown',key:'s',code:'KeyS',modifiers:2});
+    await send('Input.dispatchKeyEvent',{type:'keyUp',key:'s',code:'KeyS'});
+    assert.equal(await evaluate(`document.getElementById('confirm-dialog').open&&document.getElementById('curve-dialog').getAttribute('aria-busy')==='false'`),true,'Save shortcut cannot bypass a confirmation dialog');
+    await confirmAction(false);
+    await evaluate(`document.getElementById('curve-form').requestSubmit()`);
+    await waitFor(`!document.getElementById('curve-dialog').open`);
+    const keyboardCurve=(await saved()).curves.find(c=>c.name==='键盘保存回归');
+    assert.equal(keyboardCurve.points[0][0],32,'Recovered draft saves the committed keyboard edit');
+    await post('/api/curve/delete',{id:keyboardCurve.id});
     for(const name of ['sensors','diagnostics','devices','control'])await evaluate(`document.querySelector('[data-tab="${name}"]').click()`);
     await evaluate(`(()=>{
       window.__originalFetch=window.fetch;window.__stateReads=0;
@@ -311,13 +408,61 @@ try{
     await evaluate('window.fetch=window.__originalFetch;delete window.__originalFetch;delete window.__stateReads');
   }
   await mkdir('test-results',{recursive:true});
-  // Theme preference survives reload; every navigation destination fits narrow screens.
-  await evaluate(`document.getElementById('theme-toggle').click()`);
+  // Delay page modules to verify the first painted palette is independent of them.
+  const selectTheme=mode=>evaluate(`(()=>{const select=document.getElementById('theme-select');select.value=${JSON.stringify(mode)};select.dispatchEvent(new Event('change'))})()`);
+  const deviceTheme=value=>send('Emulation.setEmulatedMedia',{features:[{name:'prefers-color-scheme',value}]});
+  const frameProbe=await send('Page.addScriptToEvaluateOnNewDocument',{source:`window.__themeFrames=[];requestAnimationFrame(function sample(){if(document.body)window.__themeFrames.push([document.documentElement.dataset.theme,getComputedStyle(document.documentElement).backgroundColor]);if(window.__themeFrames.length<60)requestAnimationFrame(sample)})`});
+  for(const path of ['/','/edit']){
+    await deviceTheme('dark');
+    for(const [saved,expected] of [[null,'dark'],['dark','dark'],['light','light']]){
+      await evaluate(saved===null?`localStorage.removeItem('fancontrollx-theme')`:`localStorage.setItem('fancontrollx-theme',${JSON.stringify(saved)})`);
+      await send('Fetch.enable',{patterns:[{urlPattern:'*/app.js'},{urlPattern:'*/view.js'}]});
+      const previousOrigin=await evaluate('performance.timeOrigin');
+      const navigation=send('Page.navigate',{url:new URL(path,url).href});
+      await waitFor(`performance.timeOrigin!==${previousOrigin} && window.__themeFrames?.length>0 && performance.getEntriesByType('paint').some(p=>p.name==='first-contentful-paint')`);
+      assert.ok(pausedModules.length>0,'Page modules are still blocked at first paint');
+      const frames=await evaluate('window.__themeFrames');
+      assert.ok(frames.every(([theme,bg])=>theme===expected&&bg===(expected==='dark'?'rgb(20, 20, 22)':'rgb(247, 247, 248)')),`${path}: correct palette from first frame with preference ${saved}: ${JSON.stringify(frames)}`);
+      for(const requestId of pausedModules.splice(0))await send('Fetch.continueRequest',{requestId});
+      await send('Fetch.disable');
+      await navigation;
+      await waitFor('document.readyState==="complete" && document.getElementById("connection-text")?.textContent.includes("已连接")');
+      assert.equal(await evaluate(`document.getElementById('theme-select').value`),saved??'system');
+    }
+    await selectTheme('system');
+    await deviceTheme('light');
+    await waitFor(`document.documentElement.dataset.theme==='light'`);
+    await deviceTheme('dark');
+    await waitFor(`document.documentElement.dataset.theme==='dark'`);
+    await selectTheme('light');
+    await deviceTheme('light');
+    await deviceTheme('dark');
+    assert.equal(await evaluate('document.documentElement.dataset.theme'),'light','Explicit light overrides a dark device');
+    await selectTheme('dark');
+    await deviceTheme('light');
+    assert.equal(await evaluate('document.documentElement.dataset.theme'),'dark','Explicit dark overrides a light device');
+  }
+  await send('Page.removeScriptToEvaluateOnNewDocument',{identifier:frameProbe.identifier});
+  await evaluate(`localStorage.setItem('fancontrollx-theme','invalid')`);
+  await reloadPage();
+  assert.equal(await evaluate(`document.getElementById('theme-select').value`),'system','Invalid preferences fall back to device mode');
+  await selectTheme('system');
+  await reloadPage();
+  assert.equal(await evaluate(`document.getElementById('theme-select').value`),'system','Device mode survives reload');
+  const blockedStorage=await send('Page.addScriptToEvaluateOnNewDocument',{source:`Object.defineProperty(window,'localStorage',{get(){throw new DOMException('Storage disabled','SecurityError')}})`});
+  await deviceTheme('dark');
+  await reloadPage();
+  assert.equal(await evaluate('document.documentElement.dataset.theme'),'dark','Blocked storage defaults to device mode');
+  await selectTheme('light');
+  assert.equal(await evaluate('document.documentElement.dataset.theme'),'light','Theme can still change without storage');
+  await send('Page.removeScriptToEvaluateOnNewDocument',{identifier:blockedStorage.identifier});
+  await reloadPage();
+  await selectTheme('dark');
   assert.equal(await evaluate('document.documentElement.dataset.theme'),'dark');
   await reloadPage();
   await waitFor('document.getElementById("connection-text")?.textContent.includes("已连接")');
   assert.equal(await evaluate('document.documentElement.dataset.theme'),'dark');
-  assert.equal(await evaluate(`document.getElementById('theme-toggle').getAttribute('aria-pressed')`),'true');
+  assert.equal(await evaluate(`document.getElementById('theme-select').value`),'dark');
   await evaluate('window.scrollTo(0,0)');
   const prefix=snapshotOnly?'real':'demo';
   const fullScreenshot=async()=>{
@@ -327,7 +472,7 @@ try{
   };
   const dark=await fullScreenshot();
   await writeFile(`test-results/${prefix}-desktop-dark.png`,Buffer.from(dark.data,'base64'));
-  await evaluate(`document.getElementById('theme-toggle').click()`);
+  await selectTheme('light');
   assert.equal(await evaluate('document.documentElement.dataset.theme'),'light');
   for(const width of [320,768,1024]){
     await send('Emulation.setDeviceMetricsOverride',{width,height:900,deviceScaleFactor:1,mobile:width<580});
@@ -409,7 +554,7 @@ try{
     await reloadPage();
   }
   assert.deepEqual(errors,[],'Browser JavaScript exceptions');
-  console.log(`PASS: ${snapshotOnly?'read-only telemetry and responsive layout':'identification and restoration, independent sources, shared curves, drag/cancel/apply, manual slider, control switch, zero minimum, offline CRUD, curve copy/delete, edit conflict, mouse/touch/keyboard card reorder and persistence, independently scrolling nodes, fixed graph/actions and desktop/mobile layouts'}; theme persistence and 320/768/1024px navigation layouts${snapshotOnly?'':'; NVIDIA zero RPM discovery, source selection, driver bounds, zero-curve automatic status and protection'}`);
+  console.log(`PASS: ${snapshotOnly?'read-only telemetry and responsive layout':'identification and restoration, independent sources, shared curves, drag/cancel/apply, manual slider, control switch, zero minimum, offline CRUD, curve copy/delete, edit conflict, mouse/touch/keyboard card reorder and persistence, independently scrolling nodes, fixed graph/actions and desktop/mobile layouts'}; first-painted theme with delayed modules, device theme changes, explicit overrides, preference persistence, blocked storage and 320/768/1024px navigation layouts${snapshotOnly?'':'; NVIDIA zero RPM discovery, source selection, driver bounds, zero-curve automatic status and protection'}`);
 }finally{
   socket?.close();
   browser.kill('SIGTERM');

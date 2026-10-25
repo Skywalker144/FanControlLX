@@ -1,22 +1,23 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="light">
+<html lang="zh-CN">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark">
+  <script src="/theme.js"></script>
   <title>运行状态 · FanControlLX</title>
   <link rel="icon" href="/favicon.svg"><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/view.css">
   <script type="module" src="/view.js"></script>
 </head>
 <body class="viewer">
   <main class="view-main">
-    <header class="view-header"><div><a class="view-brand" href="/">FanControlLX</a><h1>风扇运行状态</h1><p id="service-caption">正在连接本机后台</p></div><div class="toolbar"><button id="theme-toggle" class="button secondary theme-toggle" aria-label="切换主题"><svg class="ui-icon theme-moon" viewBox="0 0 24 24" aria-hidden="true"><use href="/icons.svg#icon-moon"></use></svg><svg class="ui-icon theme-sun" viewBox="0 0 24 24" aria-hidden="true"><use href="/icons.svg#icon-sun"></use></svg></button><a href="/edit" class="button secondary" id="edit-link">编辑风扇</a></div></header>
+    <header class="view-header"><div><a class="view-brand" href="/">FanControlLX</a><h1>风扇运行状态</h1><p id="service-caption">正在连接本机后台</p></div><div class="toolbar"><select id="theme-select" class="button secondary theme-select" aria-label="主题模式" title="主题模式"><option value="light">浅色</option><option value="dark">深色</option><option value="system" selected>跟随设备</option></select><a href="/edit" class="button secondary" id="edit-link">编辑风扇</a></div></header>
     <div id="connection-error" class="banner error" role="status" hidden>连接已中断，读数已过期。<button class="text-button" id="retry">重新连接</button></div>
     <div id="service-error" class="banner error" role="status" hidden></div>
     <section class="metrics" aria-label="实时监控">
-      <article class="metric"><div class="metric-label">CPU 温度</div><strong><span id="cpu-temp">—</span><small>°C</small></strong></article>
-      <article class="metric"><div class="metric-label">GPU 温度</div><strong><span id="gpu-temp">—</span><small>°C</small></strong></article>
+      <article class="metric"><div class="metric-label">CPU 温度</div><strong><span id="cpu-temp">—</span><small>°C</small></strong><svg class="sparkline" id="cpu-spark" viewBox="0 0 200 42" role="img" aria-label="CPU 温度趋势"></svg></article>
+      <article class="metric"><div class="metric-label">GPU 温度</div><strong><span id="gpu-temp">—</span><small>°C</small></strong><svg class="sparkline" id="gpu-spark" viewBox="0 0 200 42" role="img" aria-label="GPU 温度趋势"></svg></article>
       <article class="metric view-service"><div class="metric-label">控制状态</div><strong id="service-value">连接中</strong><small id="machine-name"></small></article>
     </section>
-    <section aria-label="风扇状态"><div class="section-heading"><div><h2>风扇 <span id="fan-count" class="count">0</span></h2><p>只读查看 · 后台独立采样和调速</p></div></div><div id="fan-cards" class="fan-cards"></div><p id="empty" class="hint" hidden>尚未配置风扇，请进入编辑页设置设备。</p></section>
+    <section aria-label="风扇状态"><div class="section-heading fan-heading"><div><h2>风扇 <span id="fan-count" class="count">0</span></h2><p>只读查看 · 后台独立采样和调速</p></div><label class="column-setting">卡片列数<select id="fan-columns" aria-label="风扇卡片列数"><option value="auto">自动</option><option value="1">1 列</option><option value="2">2 列</option><option value="3">3 列</option><option value="4">4 列</option></select></label></div><div class="output-legend" aria-label="输出条图例"><span><i class="legend-actual" aria-hidden="true"></i>实际输出</span><span><i class="legend-target" aria-hidden="true"></i>目标输出</span></div><div id="fan-cards" class="fan-cards"></div><div id="empty" class="empty" hidden><h3>还没有风扇配置</h3><p>进入设备设置，确认设备并选择温度源与曲线。</p><a class="button secondary" href="/edit#devices">前往设备设置</a></div></section>
     <footer><span>FanControlLX <span id="version"></span> · <span id="connection-text">连接中</span></span><span id="last-update">等待更新</span></footer>
   </main>
 </body>

@@ -1,5 +1,7 @@
 // Shared browser primitives; no framework, timers, or background work.
 export const icon=name=>`<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><use href="/icons.svg#icon-${name}"></use></svg>`;
+const timeFormat=new Intl.DateTimeFormat('zh-CN',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
+export const formatTime=seconds=>timeFormat.format(new Date(seconds*1000));
 
 export function text(element,value){
   const next=String(value??'');
@@ -18,20 +20,43 @@ export function html(element,value){
   markup.set(element,value);
 }
 
-export function installTheme(button){
-  const apply=value=>{
-    document.documentElement.dataset.theme=value;
-    const dark=value==='dark',label=dark?'切换为浅色主题':'切换为深色主题';
-    attribute(button,'aria-label',label);
-    attribute(button,'title',label);
-    attribute(button,'aria-pressed',dark);
-  };
-  let saved;
-  try{saved=localStorage.getItem('fancontrollx-theme');}catch{}
-  apply(saved==='dark'?'dark':'light');
-  button.addEventListener('click',()=>{
-    const value=document.documentElement.dataset.theme==='dark'?'light':'dark';
-    apply(value);
-    try{localStorage.setItem('fancontrollx-theme',value);}catch{}
+export function spark(element,history,kind){
+  const values=history.slice(-80);let path='',drawing=false;
+  values.forEach((row,i)=>{
+    if(!Number.isFinite(row[kind])){drawing=false;return;}
+    path+=`${drawing?'L':'M'}${i/Math.max(1,values.length-1)*200},${40-(Math.max(20,Math.min(100,row[kind]))-20)/80*38} `;
+    drawing=true;
   });
+  if(!element.firstElementChild)element.innerHTML='<path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>';
+  attribute(element.firstElementChild,'d',path);
+}
+
+export function updateOutputBar(bar,output={}){
+  const actual=Number.isFinite(output.actual)?output.actual:null;
+  const target=output.requested??output.target;
+  const available=Number.isFinite(target)&&!output.automatic;
+  const width=`${Math.max(0,Math.min(100,actual??0))}%`,fill=bar.querySelector('i');
+  if(fill.style.width!==width)fill.style.width=width;
+  const marker=bar.querySelector('[data-output-target]');
+  marker.hidden=!available;
+  if(available){
+    const left=`${Math.max(0,Math.min(100,target))}%`;
+    if(marker.style.left!==left)marker.style.left=left;
+    attribute(marker,'title',`目标 ${target}%`);
+  }
+  attribute(bar,'aria-label',`当前输出 ${actual==null?'不可用':`${actual}%`} · 目标 ${output.automatic?'显卡自动调速':available?`${target}%`:'不可用'}`);
+}
+
+export function initFanColumns(select,cards){
+  const key='fancontrollx-fan-columns',choices=['auto','1','2','3','4'];
+  const apply=value=>{
+    value=choices.includes(value)?value:'auto';select.value=value;
+    if(value==='auto')cards.removeAttribute('data-columns');else cards.dataset.columns=value;
+  };
+  try{apply(localStorage.getItem(key));}catch{apply('auto');}
+  select.addEventListener('change',()=>{
+    apply(select.value);
+    try{localStorage.setItem(key,select.value);}catch{}
+  });
+  window.addEventListener('storage',event=>{if(event.key===key||event.key===null)apply(event.newValue);});
 }

@@ -1,11 +1,12 @@
 import {miniCurve, updateMiniCurve} from './curve.js';
-import {icon, text, attribute, installTheme} from './ui.js';
+import {icon, text, attribute, spark, updateOutputBar, initFanColumns, formatTime} from './ui.js';
 
 const $=id=>document.getElementById(id);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const fmt=v=>v==null?'—':Number(v).toLocaleString('zh-CN',{maximumFractionDigits:1});
+const numberFormat=new Intl.NumberFormat('zh-CN',{maximumFractionDigits:1});
+const fmt=v=>v==null?'—':numberFormat.format(Number(v));
 let state,connected=false,timer,generation=0,sequence=0,applied=0;
-installTheme($('theme-toggle'));
+initFanColumns($('fan-columns'),$('fan-cards'));
 function render(){
   $('connection-error').hidden=connected;
   text($('connection-text'),connected?'已连接 · 只读观看':'连接中断');
@@ -13,6 +14,7 @@ function render(){
   text($('gpu-temp'),fmt(connected?state?.gpu:null));
   text($('service-value'),connected?`${state.fans.filter(f=>f.output?.active).length} 路控制中`:'状态未知');
   if(!state)return;
+  for(const kind of ['cpu','gpu'])spark($(`${kind}-spark`),state.history||[],kind);
   text($('machine-name'),state.hostname);
   text($('version'),`v${state.version}`);
   text($('fan-count'),state.fans.length);
@@ -30,8 +32,8 @@ function render(){
     if(card._signature!==signature){
       card._signature=signature;
       card.innerHTML=`<div class="card-top"><span class="fan-symbol">${icon('fan')}</span><div class="card-name"><h3>${esc(f.name)}</h3><div class="chip-label">${f.mode==='manual'?'手动模式':'曲线模式'} · ${esc(f.curve_name||'独立曲线')}</div></div><span data-live="status" class="status-tag"></span></div>
-        <div class="fan-values"><div><span class="value-label">当前输出 <span class="target-reading">目标 <span data-live="target"></span></span></span><div class="output-reading"><strong data-live="actual"></strong><small>% 输出</small></div></div><div class="reading"><span data-live="rpm"></span> RPM<br><span data-live="temperature"></span> °C 输入</div></div><div class="progress"><i data-live="progress"></i></div>
-        <div class="fan-curve-preview">${miniCurve(f.points,true)}<div class="preview-caption">${f.points.length} 个节点${f.mode==='manual'?' · 手动模式，曲线未使用':''}</div></div><p class="view-fault" data-live="fault" hidden></p>`;
+        <div class="fan-values"><div class="output-reading"><strong data-live="actual"></strong><small>% 输出</small></div><div class="reading"><span data-live="rpm"></span> RPM<br><span data-live="temperature"></span> °C 输入</div></div><div class="progress" role="img"><i data-live="progress"></i><span data-output-target hidden></span></div>
+        <div class="fan-curve-preview">${miniCurve(f.points,true)}</div><p class="view-fault" data-live="fault" hidden></p>`;
       card._live=Object.fromEntries([...card.querySelectorAll('[data-live]')].map(el=>[el.dataset.live,el]));
       card._curve=card.querySelector('.fan-curve-preview>svg');
     }
@@ -40,24 +42,36 @@ function render(){
     card.classList.toggle('is-active',active);card.classList.toggle('has-fault',fault);
     text(live.status,!connected?'读数已过期':f.pending?'等待接管':o.status||'等待采样');
     attribute(live.status,'class',`status-tag ${active?'active':''} ${fault?'fault':''}`);
-    text(live.target,connected&&o.automatic?'自动':`${value('target')}%`);
     for(const key of ['actual','rpm','temperature'])text(live[key],value(key));
-    const width=`${connected?Math.max(0,Math.min(100,o.actual||0)):0}%`;
-    if(live.progress.style.width!==width)live.progress.style.width=width;
+    updateOutputBar(live.progress.parentElement,connected?o:{});
     const message=connected?(o.fault||f.pending||''):'';
     text(live.fault,message);if(live.fault.hidden!==!message)live.fault.hidden=!message;
     updateMiniCurve(card._curve,f.points,connected?o.temperature:null,f.mode);
     if($('fan-cards').children[index]!==card)$('fan-cards').insertBefore(card,$('fan-cards').children[index]||null);
   }
-  text($('last-update'),connected?`采样于 ${new Date(state.sample_time*1000).toLocaleTimeString('zh-CN',{hour12:false})}`:'读数已过期');
+  text($('last-update'),connected?`采样于 ${formatTime(state.sample_time)}`:'读数已过期');
 }
 async function refresh(){
   const request=++sequence;
+  const previous=state;
   try{
-    const r=await fetch('/api/view',{cache:'no-store',signal:AbortSignal.timeout(6000)});
+    const query=previous?.view_revision?`?since=${encodeURIComponent(previous.view_revision)}&after=${previous.history_cursor}`:'';
+    const r=await fetch(`/api/view${query}`,{cache:'no-store',signal:AbortSignal.timeout(6000)});
     if(!r.ok)throw new Error(`HTTP ${r.status}`);
     const next=await r.json();
     if(request<applied)return;
+    if(next.fans_delta){
+      if(next.view_revision!==previous?.view_revision)throw new Error('状态版本不匹配');
+      const fans=new Map(previous.fans.map(f=>[f.id,f]));
+      next.fans=next.fans.map(f=>{
+        if(!fans.has(f.id))throw new Error('缺少风扇配置');
+        return {...fans.get(f.id),...f};
+      });
+    }
+    if(next.history_delta){
+      if(next.view_revision!==previous?.view_revision)throw new Error('历史版本不匹配');
+      next.history=[...previous.history,...next.history].slice(-80);
+    }
     applied=request;state=next;connected=true;
   }catch{if(request<applied)return;applied=request;connected=false;}
   if(!document.hidden)render();
