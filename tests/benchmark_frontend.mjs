@@ -1,7 +1,7 @@
 // Isolated Chromium renderer measurements; no npm packages or hardware writes.
 // CHROME_BIN=/path/to/chrome node tests/benchmark_frontend.mjs URL OUTPUT.json
 import {spawn} from 'node:child_process';
-import {mkdtemp, rm, writeFile} from 'node:fs/promises';
+import {mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 
@@ -55,6 +55,20 @@ try{
     throw new Error(`Timed out: ${expression}`);
   };
   const metrics=async()=>Object.fromEntries((await send('Performance.getMetrics')).metrics.map(m=>[m.name,m.value]));
+  const rendererMemory=async()=>{
+    // JS heap excludes native DOM/select storage. PSS apportions shared pages
+    // across processes instead of counting each shared page in every RSS.
+    const renderers=(await send('SystemInfo.getProcessInfo',{},null)).processInfo.filter(p=>p.type==='renderer');
+    const records=await Promise.all(renderers.map(async p=>{
+      try{
+        const rollup=await readFile(`/proc/${p.id}/smaps_rollup`,'utf8');
+        const bytes=name=>Number(rollup.match(new RegExp(`^${name}:\\s+(\\d+)`,'m'))?.[1]||0)*1024;
+        return {pss_bytes:bytes('Pss'),private_bytes:bytes('Private_Clean')+bytes('Private_Dirty')};
+      }catch{return null;}
+    }));
+    if(!records.length||records.some(r=>r===null))return null;
+    return {processes:records.length,pss_bytes:records.reduce((sum,r)=>sum+r.pss_bytes,0),private_bytes:records.reduce((sum,r)=>sum+r.private_bytes,0)};
+  };
   const samples=[];
   for(const scenario of ['viewer','editor','curve-library']){
     await send('Page.navigate',{url:new URL(scenario==='viewer'?'/':'/edit',url).href});
@@ -97,11 +111,11 @@ try{
     const dom=await evaluate(`(()=>{window.__observer.disconnect();return{mutations:window.__mutations,polls:window.__polls,resources:performance.getEntriesByType('resource').filter(r=>!new URL(r.name).pathname.startsWith('/api/')).map(r=>({path:new URL(r.name).pathname,bytes:r.decodedBodySize})),nodes:document.getElementsByTagName('*').length}})()`);
     await send('HeapProfiler.collectGarbage');
     const collected=await metrics();
-    samples.push({scenario,seconds:after.Timestamp-before.Timestamp,task_ms:(after.TaskDuration-before.TaskDuration)*1000,script_ms:(after.ScriptDuration-before.ScriptDuration)*1000,layout_ms:(after.LayoutDuration-before.LayoutDuration)*1000,layouts:after.LayoutCount-before.LayoutCount,heap_bytes:collected.JSHeapUsedSize,...dom});
+    samples.push({scenario,seconds:after.Timestamp-before.Timestamp,task_ms:(after.TaskDuration-before.TaskDuration)*1000,script_ms:(after.ScriptDuration-before.ScriptDuration)*1000,layout_ms:(after.LayoutDuration-before.LayoutDuration)*1000,layouts:after.LayoutCount-before.LayoutCount,heap_bytes:collected.JSHeapUsedSize,renderer_memory:await rendererMemory(),...dom});
     console.log(JSON.stringify(samples.at(-1)));
   }
   if(errors.length)throw new Error(JSON.stringify(errors));
-  await writeFile(output,JSON.stringify({browser:await send('Browser.getVersion',{},null),configuration:size==='--large'?'64 offline fans, 128 curves, 32 points':'existing demo configuration',conditions:'Headless, GPU disabled, 1440x1100; 6.5 seconds per scenario; deterministic changing telemetry and 80-sample history, fixed config; heap after GC; renderer task time includes measurement overhead; not process RSS or power.',samples},null,2)+'\n');
+  await writeFile(output,JSON.stringify({browser:await send('Browser.getVersion',{},null),configuration:size==='--large'?'64 offline fans, 128 curves, 32 points':'existing demo configuration',conditions:'Headless, GPU disabled, 1440x1100; 6.5 seconds per scenario; deterministic changing telemetry and 80-sample history, fixed config; JS heap and Linux renderer PSS/private memory after GC; renderer task time includes measurement overhead; not whole-browser RSS or power.',samples},null,2)+'\n');
 }finally{
   socket?.close();browser.kill('SIGTERM');
   await new Promise(resolve=>{browser.once('exit',resolve);setTimeout(resolve,2000);});
