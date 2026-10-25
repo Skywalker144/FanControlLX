@@ -5,6 +5,7 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     fs,
     path::PathBuf,
@@ -34,8 +35,33 @@ pub fn interpolate(points: &Value, t: f64) -> f64 {
     }
     num(&p.last().unwrap()[1])
 }
-pub fn source_values(ids: &Value, sensors: &[Value]) -> Option<Vec<f64>> {
-    let mut result = vec![];
+// Aggregate in place: safety checks use the maximum before smoothing, even
+// when the configured control aggregation is average or minimum.
+#[derive(Default)]
+pub struct SourceValues {
+    count: usize,
+    sum: f64,
+    min: f64,
+    max: f64,
+}
+impl SourceValues {
+    fn push(&mut self, value: f64) {
+        if self.count == 0 {
+            self.min = value;
+            self.max = value;
+        } else {
+            self.min = self.min.min(value);
+            self.max = self.max.max(value);
+        }
+        self.count += 1;
+        self.sum += value;
+    }
+}
+fn source_value(id: &Value, sensors: &[Value]) -> Option<f64> {
+    sensors.iter().find(|s| s["id"] == *id)?["value"].as_f64()
+}
+pub fn source_values(ids: &Value, sensors: &[Value]) -> Option<SourceValues> {
+    let mut result = SourceValues::default();
     for id in array(ids) {
         let kinds: &[&str] = match text(id) {
             "@cpu" => &["cpu"],
@@ -44,28 +70,84 @@ pub fn source_values(ids: &Value, sensors: &[Value]) -> Option<Vec<f64>> {
             _ => &[],
         };
         if kinds.is_empty() {
-            result.push(sensors.iter().find(|s| s["id"] == *id)?["value"].as_f64()?);
+            result.push(source_value(id, sensors)?);
         } else {
             for kind in kinds {
-                let values: Option<Vec<_>> = sensors
-                    .iter()
-                    .filter(|s| text(&s["kind"]) == *kind)
-                    .map(|s| s["value"].as_f64())
-                    .collect();
-                let values = values?;
-                if values.is_empty() {
-                    return None;
+                let mut maximum: Option<f64> = None;
+                for sensor in sensors.iter().filter(|s| text(&s["kind"]) == *kind) {
+                    // Missing readings cannot be hidden by a valid maximum.
+                    let value = sensor["value"].as_f64()?;
+                    maximum = Some(maximum.map_or(value, |m| m.max(value)));
                 }
-                result.push(values.into_iter().fold(f64::NEG_INFINITY, f64::max));
+                result.push(maximum?);
             }
         }
     }
-    if result.is_empty() {
-        None
-    } else {
-        Some(result)
+    (result.count > 0).then_some(result)
+}
+
+// Resolve numeric policy and shared curve positions only on configuration
+// changes. The original JSON stays available for persistence and the editor.
+struct Policy {
+    smoothing_s: f64,
+    critical_temp: f64,
+    hysteresis: f64,
+    manual_duty: f64,
+    min_duty: f64,
+    max_duty: f64,
+    response_s: f64,
+    step_down: f64,
+    step_up: f64,
+    manual: bool,
+    curve: Option<usize>,
+}
+impl Policy {
+    fn new(f: &Value, curves: &Value) -> Self {
+        Self {
+            smoothing_s: num(&f["smoothing_s"]),
+            critical_temp: num(&f["critical_temp"]),
+            hysteresis: num(&f["hysteresis"]),
+            manual_duty: num(&f["manual_duty"]),
+            min_duty: num(&f["min_duty"]),
+            max_duty: num(&f["max_duty"]),
+            response_s: num(&f["response_s"]),
+            step_down: num(&f["step_down"]),
+            step_up: num(&f["step_up"]),
+            manual: f["mode"] == "manual",
+            curve: array(curves).iter().position(|c| c["id"] == f["curve_id"]),
+        }
+    }
+    fn all(config: &Value) -> Vec<Self> {
+        array(&config["fans"])
+            .iter()
+            .map(|f| Self::new(f, &config["curves"]))
+            .collect()
     }
 }
+
+// The control loop retains numbers and static messages, not a JSON tree per
+// fan per second. Allocate the API representation only when it is requested.
+pub struct Output {
+    temperature: Option<f64>,
+    smoothed: Option<f64>,
+    target: f64,
+    rpm: Option<f64>,
+    status: &'static str,
+    requested: f64,
+    actual: Option<f64>,
+    automatic: bool,
+    active: bool,
+    fault: Option<Cow<'static, str>>,
+}
+impl Output {
+    fn value(&self) -> Value {
+        json!({"temperature":self.temperature.map(rounded),"smoothed":self.smoothed.map(rounded),
+            "target":rounded(self.target),"rpm":self.rpm,"status":self.status,
+            "requested":rounded(self.requested),"actual":self.actual,"automatic":self.automatic,
+            "active":self.active,"fault":self.fault})
+    }
+}
+#[cfg(test)]
 pub fn compute(
     f: &Value,
     curves: &Value,
@@ -74,12 +156,23 @@ pub fn compute(
     active: bool,
     now: f64,
 ) -> Value {
+    calculate(f, curves, &Policy::new(f, curves), s, m, active, now).value()
+}
+fn calculate(
+    f: &Value,
+    curves: &Value,
+    policy: &Policy,
+    s: &Snapshot,
+    m: &mut Memory,
+    active: bool,
+    now: f64,
+) -> Output {
     let c = s.channels.iter().find(|c| c["id"] == f["channel_id"]);
     let values = source_values(&f["sensor_ids"], &s.sensors);
     let raw = values.as_ref().map(|v| match text(&f["aggregation"]) {
-        "average" => v.iter().sum::<f64>() / v.len() as f64,
-        "min" => v.iter().copied().fold(f64::INFINITY, f64::min),
-        _ => v.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        "average" => v.sum / v.count as f64,
+        "min" => v.min,
+        _ => v.max,
     });
     if let Some(raw) = raw {
         m.samples.push_back((now, raw));
@@ -87,7 +180,7 @@ pub fn compute(
     while m
         .samples
         .front()
-        .is_some_and(|p| p.0 < now - num(&f["smoothing_s"]))
+        .is_some_and(|p| p.0 < now - policy.smoothing_s)
     {
         m.samples.pop_front();
     }
@@ -98,7 +191,7 @@ pub fn compute(
             m.samples.iter().map(|p| p.1).sum::<f64>() / m.samples.len() as f64
         }
     });
-    let mut fault: Option<String> = None;
+    let mut fault: Option<Cow<'static, str>> = None;
     let mut automatic = false;
     let mut requested = None;
     let mut duty = if values.is_none() {
@@ -106,34 +199,30 @@ pub fn compute(
         100.
     } else if values
         .as_ref()
-        .is_some_and(|v| v.iter().any(|v| *v >= num(&f["critical_temp"])))
+        .is_some_and(|v| v.max >= policy.critical_temp)
     {
         fault = Some("达到保护温度，输出 100%".into());
         100.
     } else {
         let mut effective = smoothed.unwrap();
-        if let Some(temp) = m
-            .temp
-            .filter(|t| (effective - t).abs() < num(&f["hysteresis"]))
-        {
+        if let Some(temp) = m.temp.filter(|t| (effective - t).abs() < policy.hysteresis) {
             effective = temp;
         } else {
             m.temp = Some(effective);
         }
-        let points = array(curves)
-            .iter()
-            .find(|c| c["id"] == f["curve_id"])
+        let points = policy
+            .curve
+            .and_then(|index| array(curves).get(index))
             .map(|c| &c["points"])
             .unwrap_or(&f["points"]);
-        let mut d = if f["mode"] == "manual" {
-            num(&f["manual_duty"])
+        let mut d = if policy.manual {
+            policy.manual_duty
         } else {
             interpolate(points, effective)
         };
-        automatic =
-            c.is_some_and(|c| yes(&c["curve_zero_auto"])) && f["mode"] == "curve" && d == 0.;
+        automatic = c.is_some_and(|c| yes(&c["curve_zero_auto"])) && !policy.manual && d == 0.;
         if !automatic {
-            d = d.clamp(num(&f["min_duty"]), num(&f["max_duty"]));
+            d = d.clamp(policy.min_duty, policy.max_duty);
         }
         requested = Some(d);
         if automatic {
@@ -142,15 +231,15 @@ pub fn compute(
             }
         } else if let Some(mut previous) = m.duty {
             if c.is_some_and(|c| yes(&c["curve_zero_auto"])) && previous == 0. {
-                previous = num(&f["min_duty"]).max(num(&c.unwrap()["min_duty"]));
+                previous = policy.min_duty.max(num(&c.unwrap()["min_duty"]));
             }
-            if f["mode"] != "manual" && now - m.changed < num(&f["response_s"]) {
+            if !policy.manual && now - m.changed < policy.response_s {
                 d = previous;
             }
             let dt = (now - m.last).clamp(0., 5.);
             d = d.clamp(
-                previous - num(&f["step_down"]) * dt,
-                previous + num(&f["step_up"]) * dt,
+                previous - policy.step_down * dt,
+                previous + policy.step_up * dt,
             );
             if (d - previous).abs() >= 0.1 {
                 m.changed = now;
@@ -159,11 +248,11 @@ pub fn compute(
         d
     };
     if let Some(c) = c.filter(|c| c["temperature_sensor_id"].is_string()) {
-        let own = source_values(&json!([c["temperature_sensor_id"]]), &s.sensors);
+        let own = source_value(&c["temperature_sensor_id"], &s.sensors);
         if own.is_none() {
             duty = 100.;
             fault = Some("显卡自身温度不可用，保护输出 100%".into());
-        } else if own.is_some_and(|v| v.iter().any(|t| *t >= 85f64.min(num(&f["critical_temp"])))) {
+        } else if own.is_some_and(|t| t >= 85f64.min(policy.critical_temp)) {
             duty = 100.;
             fault = Some("显卡达到保护温度，输出 100%".into());
         }
@@ -195,9 +284,24 @@ pub fn compute(
     }
     m.last = now;
     m.duty = Some(duty);
-    json!({"temperature":raw.map(rounded),"smoothed":smoothed.map(rounded),"target":rounded(duty),"rpm":rpm,
-        "status":if f["channel_id"].is_null(){"待绑定通道"}else if c.is_none(){"通道离线"}else{"未接管"},
-        "requested":rounded(requested.unwrap_or(duty)),"actual":c.map(|c|&c["duty"]),"automatic":automatic,"active":active,"fault":fault})
+    Output {
+        temperature: raw,
+        smoothed,
+        target: duty,
+        rpm,
+        status: if f["channel_id"].is_null() {
+            "待绑定通道"
+        } else if c.is_none() {
+            "通道离线"
+        } else {
+            "未接管"
+        },
+        requested: requested.unwrap_or(duty),
+        actual: c.and_then(|c| c["duty"].as_f64()),
+        automatic,
+        active,
+        fault,
+    }
 }
 struct Identification {
     channel: String,
@@ -210,11 +314,24 @@ struct Identification {
     fault: Option<String>,
     expires: f64,
 }
+// Keep history as numbers in the control loop. JSON objects and field names
+// are only allocated when an HTTP client actually asks for these samples.
+struct HistorySample {
+    time: f64,
+    cpu: Option<f64>,
+    gpu: Option<f64>,
+}
+impl HistorySample {
+    fn value(&self) -> Value {
+        json!({"time":self.time,"cpu":self.cpu,"gpu":self.gpu})
+    }
+}
 pub struct Engine {
     pub hardware: Box<dyn Hardware>,
     pub config: Value,
+    policies: Vec<Policy>,
     pub snapshot: Snapshot,
-    pub outputs: Value,
+    pub outputs: HashMap<String, Output>,
     pub enabled: HashSet<String>,
     pub leases: HashMap<String, Value>,
     pub memory: HashMap<String, Memory>,
@@ -227,9 +344,12 @@ pub struct Engine {
     path: PathBuf,
     start: Instant,
     identification: Option<Identification>,
-    history: VecDeque<Value>,
+    history: VecDeque<HistorySample>,
     events: VecDeque<Value>,
     revision: String,
+    view_session: String,
+    view_revision: String,
+    history_cursor: u64,
     disarmed: Vec<Value>,
     discovery: Discovery,
 }
@@ -264,9 +384,10 @@ impl Engine {
         };
         let mut e = Self {
             hardware,
+            policies: Policy::all(&config),
             config,
             snapshot: Snapshot::default(),
-            outputs: json!({}),
+            outputs: HashMap::new(),
             enabled: HashSet::new(),
             leases: HashMap::new(),
             memory: HashMap::new(),
@@ -279,9 +400,12 @@ impl Engine {
             path,
             start: Instant::now(),
             identification: None,
-            history: VecDeque::new(),
+            history: VecDeque::with_capacity(180),
             events: VecDeque::new(),
             revision: String::new(),
+            view_session: token()?,
+            view_revision: String::new(),
+            history_cursor: 0,
             disarmed: vec![],
             discovery: Discovery::default(),
         };
@@ -303,6 +427,10 @@ impl Engine {
             config::save(&self.path, &v)?;
         }
         self.revision = hash(&serde_json::to_vec(&v)?);
+        self.view_revision = format!("{}-{}", self.view_session, self.revision);
+        self.outputs
+            .retain(|id, _| array(&v["fans"]).iter().any(|f| text(&f["id"]) == id));
+        self.policies = Policy::all(&v);
         self.config = v;
         Ok(())
     }
@@ -359,10 +487,21 @@ impl Engine {
         });
         let now = self.now();
         let force = self.discovery.due(now, recovery);
-        let sample = self.hardware.sample(force)?;
+        let mut sample = std::mem::take(&mut self.snapshot);
+        if let Err(error) = self.hardware.sample_into(force, &mut sample) {
+            self.snapshot = sample;
+            return Err(error);
+        }
         self.tick_with(sample, self.now())
     }
     pub fn tick_with(&mut self, s: Snapshot, now: f64) -> Result<()> {
+        let result = self.apply_sample(&s, now);
+        // Even a failed control write must retain the fresh readings and the
+        // reusable sampling storage for recovery and subsequent API requests.
+        self.snapshot = s;
+        result
+    }
+    fn apply_sample(&mut self, s: &Snapshot, now: f64) -> Result<()> {
         if self
             .identification
             .as_ref()
@@ -402,19 +541,32 @@ impl Engine {
                 return Err(e);
             }
         }
-        let mut outputs = json!({});
         // Indexing gives each fan a short borrow. Only failure metadata is
         // copied before recovery; the full configuration is never cloned here.
         for index in 0..array(&self.config["fans"]).len() {
             let f = &self.config["fans"][index];
-            let id = text(&f["id"]).to_owned();
-            let active = self.enabled.contains(&id);
-            let m = self.memory.entry(id.clone()).or_insert_with(|| Memory {
-                last: now,
-                changed: now,
-                ..Memory::default()
-            });
-            let mut o = compute(f, &self.config["curves"], &s, m, active, now);
+            let id = text(&f["id"]);
+            let active = self.enabled.contains(id);
+            if !self.memory.contains_key(id) {
+                self.memory.insert(
+                    id.to_owned(),
+                    Memory {
+                        last: now,
+                        changed: now,
+                        ..Memory::default()
+                    },
+                );
+            }
+            let m = self.memory.get_mut(id).unwrap();
+            let mut o = calculate(
+                f,
+                &self.config["curves"],
+                &self.policies[index],
+                s,
+                m,
+                active,
+                now,
+            );
             if active {
                 let key = text(&f["channel_id"]);
                 let result = if s
@@ -429,44 +581,53 @@ impl Engine {
                 match result {
                     Ok(r) => {
                         if r["fault"].is_string() {
-                            o["automatic"] = json!(false);
-                            o["target"] = r["duty"].clone();
-                            o["requested"] = r["duty"].clone();
+                            o.automatic = false;
+                            o.target = num(&r["duty"]);
+                            o.requested = num(&r["duty"]);
                             m.duty = r["duty"].as_f64();
-                            if o["fault"].is_null() {
-                                o["fault"] = r["fault"].clone();
+                            if o.fault.is_none() {
+                                o.fault = Some(text(&r["fault"]).to_owned().into());
                             }
                         }
-                        o["status"] = json!(if !o["fault"].is_null() {
+                        o.status = if o.fault.is_some() {
                             "保护运行"
-                        } else if yes(&o["automatic"]) {
+                        } else if o.automatic {
                             "显卡自动调速"
                         } else {
                             "正在控制"
-                        });
+                        };
                     }
                     Err(e) => {
+                        let id = id.to_owned();
                         let autostart = yes(&f["autostart"]);
                         let name = text(&f["name"]).to_owned();
                         let _ = self.release(&id, true);
                         if self.managed && autostart {
                             self.pending.insert(id.clone(), (e.1.clone(), now + 10.));
                         }
-                        o["status"] = json!("控制失败");
-                        o["fault"] = json!(e.1);
-                        o["active"] = json!(false);
+                        o.status = "控制失败";
+                        o.fault = Some(e.1.clone().into());
+                        o.active = false;
                         self.event(format!("{name}：{e}"));
                     }
                 }
             }
-            outputs[id] = o;
+            let id = text(&self.config["fans"][index]["id"]);
+            if let Some(output) = self.outputs.get_mut(id) {
+                *output = o;
+            } else {
+                self.outputs.insert(id.to_owned(), o);
+            }
         }
-        self.outputs = outputs;
-        self.history.push_back(json!({"time":wall(),"cpu":Self::group(&s.sensors,"cpu"),"gpu":Self::group(&s.sensors,"gpu")}));
-        if self.history.len() > 180 {
+        self.history_cursor += 1;
+        if self.history.len() == 180 {
             self.history.pop_front();
         }
-        self.snapshot = s;
+        self.history.push_back(HistorySample {
+            time: wall(),
+            cpu: Self::group(&s.sensors, "cpu"),
+            gpu: Self::group(&s.sensors, "gpu"),
+        });
         Ok(())
     }
     pub fn cycle(&mut self) {
@@ -488,32 +649,58 @@ impl Engine {
     pub fn state(&self, since: Option<&str>, after: Option<f64>) -> Value {
         let (gpu_error, gpu_control_error) = self.hardware.errors();
         let identification=self.identification.as_ref().map(|t|json!({"channel_id":t.channel,"duty":t.duty,"effective_duty":t.effective,"fault":t.fault,"remaining_s":(t.expires-self.now()).max(0.).ceil(),"stopping":t.stopping}));
-        let mut v = json!({"sensors":self.snapshot.sensors,"fans":self.snapshot.fans,"channels":self.snapshot.channels,"chips":self.snapshot.chips,"outputs":self.outputs,
-            "history":self.history.iter().filter(|h|after.is_none_or(|t|num(&h["time"])>t)).collect::<Vec<_>>(),"history_delta":after.is_some(),
+        let mut v = json!({"sensors":self.snapshot.sensors,"fans":self.snapshot.fans,"channels":self.snapshot.channels,"chips":self.snapshot.chips,"outputs":self.outputs.iter().map(|(id,o)|(id.clone(),o.value())).collect::<serde_json::Map<_,_>>(),
+            "history_delta":after.is_some(),
             "events":self.events,"demo":self.demo,"control_allowed":self.allow,"error":self.error,"gpu_error":gpu_error,"gpu_control_error":gpu_control_error,
             "time":wall(),"discovery":self.discovery(),"identification":identification,"background_service":self.managed,"config_revision":self.revision,"workspace_api":2,
             "pending_autostart":self.pending.iter().map(|(id,p)|(id.clone(),json!(p.0))).collect::<serde_json::Map<_,_>>(),"runtime":"rust"});
+        v["history"] = Value::Array(
+            self.history
+                .iter()
+                .filter(|h| after.is_none_or(|t| h.time > t))
+                .map(HistorySample::value)
+                .collect(),
+        );
         if since != Some(&self.revision) {
             v["config"] = self.config.clone();
         }
         v
     }
-    pub fn view_state(&self) -> Value {
+    pub fn view_state(&self, since: Option<&str>, after: Option<u64>) -> Value {
         // Only expose cached readings and the resolved curve for display; omit
-        // full configuration, tokens, discovery metadata, logs and history.
-        json!({"time":wall(),"sample_time":self.history.back().map(|h|&h["time"]),
+        // full configuration, tokens, discovery metadata and logs.
+        let unchanged = since == Some(&self.view_revision);
+        let after = after.filter(|cursor| {
+            unchanged && *cursor <= self.history_cursor && self.history_cursor - cursor <= 80
+        });
+        let count = after.map_or(80, |cursor| (self.history_cursor - cursor) as usize);
+        let mut v = json!({"time":wall(),"sample_time":self.history.back().map(|h|h.time),
             "runtime":"rust","demo":self.demo,"background_service":self.managed,"error":self.error,
             "cpu":Self::group(&self.snapshot.sensors,"cpu"),"gpu":Self::group(&self.snapshot.sensors,"gpu"),
+            "view_revision":self.view_revision,"fans_delta":unchanged,
+            "history_cursor":self.history_cursor,"history_delta":after.is_some(),
             "fans":array(&self.config["fans"]).iter().map(|f|{
+                if unchanged {
+                    return json!({"id":f["id"],"output":self.outputs.get(text(&f["id"])).map(Output::value),
+                        "pending":self.pending.get(text(&f["id"])).map(|p|&p.0)});
+                }
                 let curve = array(&self.config["curves"]).iter().find(|c| c["id"] == f["curve_id"]);
                 json!({
                     "id":f["id"],"name":f["name"],"mode":f["mode"],
                     "points":curve.map(|c|&c["points"]).unwrap_or(&f["points"]),
                     "curve_name":curve.map(|c|&c["name"]),
-                    "output":self.outputs[text(&f["id"])],
+                    "output":self.outputs.get(text(&f["id"])).map(Output::value),
                     "pending":self.pending.get(text(&f["id"])).map(|p|&p.0)
                 })
-            }).collect::<Vec<_>>()})
+            }).collect::<Vec<_>>()});
+        v["history"] = Value::Array(
+            self.history
+                .iter()
+                .skip(self.history.len().saturating_sub(count))
+                .map(HistorySample::value)
+                .collect(),
+        );
+        v
     }
     pub fn discovery(&self) -> Vec<Value> {
         self.snapshot.channels.iter().map(|c|{
@@ -581,9 +768,7 @@ impl Engine {
     }
     fn identification_duty(duty: f64, s: &[Value], c: Option<&Value>) -> (f64, Option<String>) {
         if let Some(c) = c.filter(|c| c["temperature_sensor_id"].is_string()) {
-            if source_values(&json!([c["temperature_sensor_id"]]), s)
-                .is_none_or(|v| v.iter().any(|t| *t >= 85.))
-            {
+            if source_value(&c["temperature_sensor_id"], s).is_none_or(|t| t >= 85.) {
                 return (100., Some("显卡温度异常，识别测试保持 100%".into()));
             }
         } else if source_values(&json!(["@cpu"]), s).is_none()
@@ -738,9 +923,9 @@ impl Engine {
         let high = num(&f["max_duty"])
             .min(c["max_duty"].as_f64().unwrap_or(100.))
             .max(low);
-        let initial = if yes(&o["automatic"]) {
+        let initial = if o.automatic {
             0.
-        } else if !o["fault"].is_null() {
+        } else if o.fault.is_some() {
             100.
         } else {
             50f64.clamp(low, high)

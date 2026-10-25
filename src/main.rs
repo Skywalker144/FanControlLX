@@ -5,6 +5,8 @@ mod hardware;
 mod install;
 mod lock;
 mod nvml;
+#[cfg(test)]
+mod perf_tests;
 mod runtime;
 mod server;
 #[cfg(test)]
@@ -120,13 +122,13 @@ fn run() -> Result<()> {
     };
     if diagnose || benchmark.is_some() {
         if let Some(count) = benchmark {
-            hardware.sample(true)?;
+            let mut snapshot = hardware.sample(true)?;
             let start = Instant::now();
             let cpu = cpu_time();
             let mut durations = vec![];
             for _ in 0..count {
                 let t = Instant::now();
-                hardware.sample(false)?;
+                hardware.sample_into(false, &mut snapshot)?;
                 durations.push(t.elapsed().as_secs_f64() * 1000.);
                 if stop.load(Ordering::Relaxed) {
                     break;

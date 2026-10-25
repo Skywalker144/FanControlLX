@@ -7,7 +7,9 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     fs,
+    io::Read,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -17,9 +19,16 @@ pub struct Snapshot {
     pub fans: Vec<Value>,
     pub channels: Vec<Value>,
     pub chips: Vec<Value>,
+    // Globally unique discovery generation; a snapshot from another source
+    // cannot accidentally reuse this source's topology.
+    pub(crate) hwmon_generation: u64,
 }
 pub trait Hardware: Send {
     fn sample(&mut self, force: bool) -> Result<Snapshot>;
+    fn sample_into(&mut self, force: bool, snapshot: &mut Snapshot) -> Result<()> {
+        *snapshot = self.sample(force)?;
+        Ok(())
+    }
     fn acquire(&mut self, key: &str, duty: f64) -> Result<Value>;
     fn write(&mut self, key: &str, duty: f64) -> Result<Value>;
     fn restore(&mut self, lease: &Value) -> Result<()>;
@@ -35,8 +44,26 @@ fn read(path: &Path) -> String {
         .to_owned()
 }
 fn number_at(path: &Path) -> Option<f64> {
-    // Parse the read buffer directly; numeric sampling needs no trimmed copy.
-    fs::read_to_string(path)
+    // Sysfs numeric attributes fit in a few bytes. Keep a bounded stack buffer
+    // instead of stat'ing and allocating a String for every reading. Reopen on
+    // each sample so removed/replaced devices never leave a cached descriptor.
+    let mut file = fs::File::open(path).ok()?;
+    let mut bytes = [0; 64];
+    let mut len = 0;
+    loop {
+        match file.read(&mut bytes[len..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                len += n;
+                if len == bytes.len() {
+                    return None; // Never accept a truncated numeric prefix.
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    std::str::from_utf8(&bytes[..len])
         .ok()?
         .trim()
         .parse::<f64>()
@@ -69,6 +96,15 @@ fn pwm_name(s: &str) -> bool {
     s.strip_prefix("pwm")
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
+fn update_field(row: &mut Value, field: &str, value: Value) {
+    // Value's IndexMut allocates a new key even when that key already exists.
+    // Sampling updates existing fields almost exclusively.
+    if let Some(current) = row.get_mut(field) {
+        *current = value;
+    } else {
+        row[field] = value;
+    }
+}
 struct Reading {
     meta: Value,
     path: PathBuf,
@@ -94,6 +130,7 @@ pub struct Real {
     channels: HashMap<String, Channel>,
     channel_order: Vec<String>,
     chips: Vec<Value>,
+    generation: u64,
     nvml: Option<Nvml>,
     gpu_entries: Vec<GpuEntry>,
     gpu_at: Option<Instant>,
@@ -124,6 +161,7 @@ impl Real {
             channels: HashMap::new(),
             channel_order: vec![],
             chips: vec![],
+            generation: 0,
             nvml: None,
             gpu_entries: vec![],
             gpu_at: None,
@@ -229,6 +267,8 @@ impl Real {
         self.channel_order.sort();
         self.at = Some(Instant::now());
         self.invalidated = false;
+        static GENERATION: AtomicU64 = AtomicU64::new(1);
+        self.generation = GENERATION.fetch_add(1, Ordering::Relaxed);
     }
     fn gpu(&mut self, s: &mut Snapshot, force: bool) {
         if self.nvml.is_none() && Instant::now() >= self.gpu_retry {
@@ -433,6 +473,11 @@ impl Real {
 }
 impl Hardware for Real {
     fn sample(&mut self, force: bool) -> Result<Snapshot> {
+        let mut snapshot = Snapshot::default();
+        self.sample_into(force, &mut snapshot)?;
+        Ok(snapshot)
+    }
+    fn sample_into(&mut self, force: bool, s: &mut Snapshot) -> Result<()> {
         if force
             || self.at.is_none()
             || (self.invalidated
@@ -442,48 +487,66 @@ impl Hardware for Real {
         {
             self.discover();
         }
-        let mut s = Snapshot {
-            chips: self.chips.clone(),
-            ..Snapshot::default()
-        };
+        if s.hwmon_generation != self.generation {
+            s.sensors = self.sensors.iter().map(|r| r.meta.clone()).collect();
+            s.fans = self.fans.iter().map(|r| r.meta.clone()).collect();
+            s.channels = self
+                .channel_order
+                .iter()
+                .map(|key| self.channels[key].meta.clone())
+                .collect();
+            s.chips.clone_from(&self.chips);
+            s.hwmon_generation = self.generation;
+        } else {
+            // Drop last cycle's GPU rows before appending fresh GPU telemetry.
+            // hwmon objects and their field/name allocations remain in place.
+            s.sensors.truncate(self.sensors.len());
+            s.fans.truncate(self.fans.len());
+            s.channels.truncate(self.channel_order.len());
+            s.chips.truncate(self.chips.len());
+        }
         let mut stale = false;
-        for r in &self.sensors {
-            let mut m = r.meta.clone();
+        for (r, m) in self.sensors.iter().zip(&mut s.sensors) {
             let v = number_at(&r.path)
                 .map(|v| v / 1000.)
                 .filter(|v| (-40.0..=150.).contains(v));
             stale |= v.is_none();
-            m["value"] = json!(v);
-            s.sensors.push(m);
+            update_field(m, "value", json!(v));
         }
-        for r in &self.fans {
-            let mut m = r.meta.clone();
+        for (r, m) in self.fans.iter().zip(&mut s.fans) {
             let v = number_at(&r.path);
             stale |= v.is_none();
-            m["rpm"] = json!(v);
-            s.fans.push(m);
+            update_field(m, "rpm", json!(v));
         }
-        for key in &self.channel_order {
+        for (key, m) in self.channel_order.iter().zip(&mut s.channels) {
             let c = &self.channels[key];
-            let mut m = c.meta.clone();
             let duty = number_at(&c.pwm);
             let mode = number_at(&c.enable);
             if duty.is_none() || mode.is_none() {
-                m["writable"] = json!(false);
-                m["reason"] = json!("通道读数不可用");
+                update_field(m, "writable", json!(false));
+                if m["reason"] != "通道读数不可用" {
+                    update_field(m, "reason", json!("通道读数不可用"));
+                }
                 stale = true;
+            } else {
+                // Recover from transient read errors without losing the
+                // original permission/driver restrictions in the metadata.
+                update_field(m, "writable", c.meta["writable"].clone());
+                if m["reason"] != c.meta["reason"] {
+                    update_field(m, "reason", c.meta["reason"].clone());
+                }
             }
-            m["duty"] = duty
+            let duty = duty
                 .map(|v| rounded(v / 255. * 100.))
                 .unwrap_or(Value::Null);
-            m["mode"] = json!(mode);
-            s.channels.push(m);
+            update_field(m, "duty", duty);
+            update_field(m, "mode", json!(mode));
         }
         if stale {
             self.invalidated = true;
         }
-        self.gpu(&mut s, force);
-        Ok(s)
+        self.gpu(s, force);
+        Ok(())
     }
     fn acquire(&mut self, key: &str, duty: f64) -> Result<Value> {
         if key.starts_with("nvidia/") {
@@ -557,6 +620,13 @@ impl Hardware for Real {
         if l["backend"] == "nvidia" {
             self.request(json!({"action":"restore","channel_id":key,"token":l["token"]}))?;
             self.gpu_leases.remove(key);
+            if self.gpu_leases.is_empty() {
+                // The last successful restore no longer needs a resident NVML
+                // writer. Closing its socket lets it finish recovery and exit;
+                // request() starts a fresh writer on the next acquisition.
+                // Failed restores return above and keep the watchdog alive.
+                self.client = None;
+            }
         } else {
             // Reconnect by stable chip/device identity, never by a recycled
             // class/hwmonN symlink. The hwmon index may change after a reload.
@@ -656,6 +726,88 @@ impl Hardware for Demo {
 mod cache_tests {
     use super::*;
     use crate::tests::Temp;
+
+    #[test]
+    fn reused_snapshot_recovers_readings_and_rebuilds_changed_topology() {
+        let t = Temp::new();
+        let chip = t.0.join("hwmon0");
+        fs::create_dir(&chip).unwrap();
+        for (name, value) in [
+            ("name", "nct6687"),
+            ("temp1_input", "50000"),
+            ("fan1_input", "1200"),
+            ("pwm1", "100"),
+            ("pwm1_enable", "2"),
+        ] {
+            fs::write(chip.join(name), value).unwrap();
+        }
+        let mut h = Real::with_root(t.0.clone(), None);
+        h.gpu_retry = Instant::now() + Duration::from_secs(3600);
+        h.fallback_at = Some(Instant::now() + Duration::from_secs(3600));
+        let mut s = h.sample(true).unwrap();
+        let writable = s.channels[0]["writable"].clone();
+        let reason = s.channels[0]["reason"].clone();
+        let original_generation = s.hwmon_generation;
+        fs::remove_file(chip.join("temp1_input")).unwrap();
+        fs::remove_file(chip.join("pwm1_enable")).unwrap();
+        fs::write(chip.join("fan1_input"), "0").unwrap();
+        h.sample_into(false, &mut s).unwrap();
+        assert!(s.sensors[0]["value"].is_null());
+        assert_eq!(s.fans[0]["rpm"], 0.);
+        assert_eq!(s.channels[0]["writable"], false);
+        assert!(s.channels[0]["mode"].is_null());
+        fs::write(chip.join("temp1_input"), "61000").unwrap();
+        fs::write(chip.join("pwm1_enable"), "2").unwrap();
+        h.sample_into(false, &mut s).unwrap();
+        assert_eq!(s.sensors[0]["value"], 61.);
+        assert_eq!(s.channels[0]["writable"], writable);
+        assert_eq!(s.channels[0]["reason"], reason);
+        assert_eq!(s.hwmon_generation, original_generation);
+        // Reordering/new sensors and metadata changes replace the old layout.
+        fs::write(chip.join("temp1_label"), "renamed").unwrap();
+        fs::write(chip.join("temp2_input"), "65000").unwrap();
+        fs::remove_file(chip.join("fan1_input")).unwrap();
+        h.sample_into(true, &mut s).unwrap();
+        assert_ne!(s.hwmon_generation, original_generation);
+        assert_eq!(s.sensors.len(), 2);
+        assert_eq!(s.sensors[0]["name"], "renamed");
+        assert_eq!(s.sensors[1]["value"], 65.);
+        assert!(s.fans.is_empty());
+        // No stale entries survive complete device removal.
+        fs::remove_dir_all(chip).unwrap();
+        h.sample_into(true, &mut s).unwrap();
+        assert!(
+            s.sensors.is_empty()
+                && s.fans.is_empty()
+                && s.channels.is_empty()
+                && s.chips.is_empty()
+        );
+    }
+    #[test]
+    fn numeric_reads_are_bounded_fresh_and_reject_invalid_input() {
+        let t = Temp::new();
+        let path = t.0.join("temp1_input");
+        for (value, expected) in [
+            ("  -12345\n", Some(-12345.)),
+            ("0\n", Some(0.)),
+            ("123.5", Some(123.5)),
+            ("", None),
+            ("NaN", None),
+            ("inf", None),
+            ("123\njunk", None),
+        ] {
+            fs::write(&path, value).unwrap();
+            assert_eq!(number_at(&path), expected);
+        }
+        fs::write(&path, "1".repeat(64)).unwrap();
+        assert_eq!(number_at(&path), None);
+        fs::write(&path, [0xff]).unwrap();
+        assert_eq!(number_at(&path), None);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(number_at(&path), None);
+        fs::write(&path, "61000").unwrap();
+        assert_eq!(number_at(&path), Some(61000.));
+    }
     #[test]
     fn healthy_background_keeps_metadata_until_manual_scan() {
         let t = Temp::new();
@@ -710,5 +862,34 @@ mod cache_tests {
         assert!(!yes(&c["writable"]));
         assert!(h.acquire(text(&c["id"]), 50.).is_err());
         assert_eq!(fs::read_to_string(chip.join("pwm1")).unwrap(), "100");
+    }
+
+    #[test]
+    #[ignore = "opt-in synthetic performance measurement"]
+    fn benchmark_hwmon_sampling() {
+        let t = Temp::new();
+        let chip = t.0.join("hwmon0");
+        fs::create_dir(&chip).unwrap();
+        fs::write(chip.join("name"), "nct6687").unwrap();
+        for i in 1..=32 {
+            fs::write(chip.join(format!("temp{i}_input")), "50000").unwrap();
+        }
+        for i in 1..=8 {
+            for (name, value) in [
+                (format!("fan{i}_input"), "1200"),
+                (format!("pwm{i}"), "100"),
+                (format!("pwm{i}_enable"), "2"),
+            ] {
+                fs::write(chip.join(name), value).unwrap();
+            }
+        }
+        let mut h = Real::with_root(t.0.clone(), None);
+        h.gpu_retry = Instant::now() + Duration::from_secs(3600);
+        h.fallback_at = Some(Instant::now() + Duration::from_secs(3600));
+        let mut snapshot = h.sample(true).unwrap();
+        crate::perf_tests::measure("hwmon_32_temperatures_8_fans_8_channels", 2000, || {
+            h.sample_into(false, &mut snapshot).unwrap();
+            std::hint::black_box(&snapshot);
+        });
     }
 }

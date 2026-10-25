@@ -15,6 +15,7 @@ const JS: &[u8] = include_bytes!("../static/app.js");
 const CURVE_JS: &[u8] = include_bytes!("../static/curve.js");
 const CURVE_EDITOR_JS: &[u8] = include_bytes!("../static/curve-editor.js");
 const UI_JS: &[u8] = include_bytes!("../static/ui.js");
+const THEME_JS: &[u8] = include_bytes!("../static/theme.js");
 const CONFIRM_JS: &[u8] = include_bytes!("../static/confirm.js");
 const ICONS: &[u8] = include_bytes!("../static/icons.svg");
 const CSS: &[u8] = include_bytes!("../static/style.css");
@@ -76,6 +77,7 @@ fn assets() -> &'static [Asset] {
             (&["/curve.js"], CURVE_JS, js),
             (&["/curve-editor.js"], CURVE_EDITOR_JS, js),
             (&["/ui.js"], UI_JS, js),
+            (&["/theme.js"], THEME_JS, js),
             (&["/confirm.js"], CONFIRM_JS, js),
             (&["/app.js"], JS, js),
             (&["/style.css"], CSS, css),
@@ -238,7 +240,14 @@ fn handle(
             return Ok(());
         }
         let operation = match path {
-            "/api/view" => Operation::View,
+            "/api/view" => {
+                let params: HashMap<_, _> =
+                    query.split('&').filter_map(|p| p.split_once('=')).collect();
+                Operation::View {
+                    since: params.get("since").map(|s| (*s).to_owned()),
+                    after: params.get("after").and_then(|s| s.parse().ok()),
+                }
+            }
             "/api/state" => {
                 let params: HashMap<_, _> =
                     query.split('&').filter_map(|p| p.split_once('=')).collect();

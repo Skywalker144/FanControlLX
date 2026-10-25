@@ -112,7 +112,7 @@ class RustHTTPTests(unittest.TestCase):
 
     def test_assets_security_and_input_validation(self):
         self.assertEqual(self.state["runtime"], "rust")
-        for asset in ("/", "/view", "/edit", "/view.js", "/view.css", "/app.js", "/curve.js", "/curve-editor.js", "/ui.js", "/confirm.js", "/icons.svg", "/style.css", "/favicon.svg", "/api/health"):
+        for asset in ("/", "/view", "/edit", "/view.js", "/view.css", "/app.js", "/curve.js", "/curve-editor.js", "/ui.js", "/theme.js", "/confirm.js", "/icons.svg", "/style.css", "/favicon.svg", "/api/health"):
             self.assertEqual(self.request(asset)[0], 200)
         self.assertEqual(self.request("/../../data/config.json")[0], 404)
         self.assertEqual(self.request("/api/state", headers={"Host": "evil.example"})[0], 403)
@@ -149,8 +149,11 @@ class RustHTTPTests(unittest.TestCase):
         code, body = self.request("/api/view")
         self.assertEqual(code, 200)
         view = json.loads(body)
-        for field in ("config", "csrf_token", "discovery", "history", "events"):
+        for field in ("config", "csrf_token", "discovery", "events"):
             self.assertNotIn(field, view)
+        self.assertGreater(len(view["history"]), 0)
+        self.assertLessEqual(len(view["history"]), 80)
+        self.assertEqual(set(view["history"][-1]), {"time", "cpu", "gpu"})
         self.assertLess(len(body), len(json.dumps(before)))
         self.assertEqual([f["id"] for f in view["fans"]], [f["id"] for f in before["config"]["fans"]])
         self.assertEqual(self.request("/api/editor-heartbeat", {}, {"X-FanControl-Token": ""})[0], 403)
@@ -166,6 +169,29 @@ class RustHTTPTests(unittest.TestCase):
                      "/api/release-all", "/api/scan"):
             with self.subTest(path=path):
                 self.assertEqual(self.request(path, {}, {"X-FanControl-Token": ""})[0], 403)
+
+    def test_viewer_delta_protocol_and_restart(self):
+        view = json.loads(self.request("/api/view")[1])
+        query = f"/api/view?since={view['view_revision']}&after={view['history_cursor']}"
+        delta = json.loads(self.request(query)[1])
+        self.assertTrue(delta["history_delta"])
+        self.assertTrue(delta["fans_delta"])
+        self.assertNotIn("points", delta["fans"][0])
+        self.assertEqual(delta["history_cursor"] - view["history_cursor"], len(delta["history"]))
+        self.assertEqual(delta["fans"][0]["id"], view["fans"][0]["id"])
+        for cursor in ("-1", "nan", str(2**64), str(2**64 - 1)):
+            reset = json.loads(self.request(query.rsplit("=", 1)[0] + "=" + cursor)[1])
+            self.assertFalse(reset["history_delta"])
+            self.assertGreater(len(reset["history"]), 0)
+        # Persist exactly the same configuration across the service restart.
+        self.post("/api/config", self.get()["config"])
+        self.stop()
+        self.start()
+        reset = json.loads(self.request(query)[1])
+        self.assertFalse(reset["fans_delta"])
+        self.assertFalse(reset["history_delta"])
+        self.assertIn("points", reset["fans"][0])
+        self.assertNotEqual(reset["view_revision"], view["view_revision"])
 
     def test_delta_and_concurrent_configuration(self):
         state = self.get()
@@ -378,6 +404,22 @@ class RustGPUProcessTests(unittest.TestCase):
         self.process.wait(timeout=5)
         self.assertEqual(self.state(), (0, 0))
         self.assertEqual(self.journal()["leases"], [])
+
+    def test_idle_writer_can_exit_and_restart_after_last_restore(self):
+        self.start(1, 42)
+        lease = self.request("acquire", duty=60)["result"]
+        self.request("restore", token=lease["token"])
+        writes = (self.data / "writes").read_text()
+        self.file.close(); self.sock.close()
+        self.process.wait(timeout=5)
+        self.assertEqual(self.process.returncode, 0)
+        self.assertEqual((self.data / "writes").read_text(), writes)
+        self.assertEqual(self.journal()["leases"], [])
+        self.start(1, 42)
+        lease = self.request("acquire", duty=70)["result"]
+        self.assertEqual(self.state(), (1, 70))
+        self.request("restore", token=lease["token"])
+        self.assertEqual(self.state(), (1, 42))
 
     def test_sigkill_recovery_hook_uses_durable_journal(self):
         self.start(1, 42)

@@ -14,7 +14,10 @@ pub enum Operation {
         since: Option<String>,
         after: Option<f64>,
     },
-    View,
+    View {
+        since: Option<String>,
+        after: Option<u64>,
+    },
     Write {
         path: String,
         body: Value,
@@ -109,7 +112,7 @@ impl Controller {
         }
         let result = match command.operation {
             Operation::State { since, after } => engine.state(since.as_deref(), after),
-            Operation::View => engine.view_state(),
+            Operation::View { since, after } => engine.view_state(since.as_deref(), after),
             Operation::Write { path, body } => {
                 if path != "/api/editor-heartbeat" {
                     // Do not keep serving old readings if a disk/driver call

@@ -161,6 +161,65 @@ fn sources_require_every_selected_group() {
     assert!(source_values(&json!(["@cpu"]), &s.sensors).is_none());
 }
 #[test]
+fn aggregation_counts_groups_once_and_protects_on_any_missing_or_hot_source() {
+    let (mut f, mut s, _) = policy();
+    s.sensors = vec![
+        json!({"id":"a","kind":"cpu","value":40}),
+        json!({"id":"b","kind":"cpu","value":60}),
+        json!({"id":"c","kind":"gpu","value":30}),
+        json!({"id":"d","kind":"other","value":20}),
+    ];
+    f["sensor_ids"] = json!(["@cpu-gpu", "d"]);
+    for (aggregation, expected) in [("max", 60.), ("min", 20.), ("average", 36.7)] {
+        f["aggregation"] = json!(aggregation);
+        let output = compute(&f, &json!([]), &s, &mut Memory::default(), false, 0.);
+        assert_eq!(num(&output["temperature"]), expected);
+        s.sensors[1]["value"] = json!(100);
+        let output = compute(&f, &json!([]), &s, &mut Memory::default(), false, 1.);
+        assert_eq!(num(&output["target"]), 100.);
+        assert!(output["fault"].is_string());
+        s.sensors[1]["value"] = Value::Null;
+        let output = compute(&f, &json!([]), &s, &mut Memory::default(), false, 2.);
+        assert!(output["temperature"].is_null());
+        assert_eq!(num(&output["target"]), 100.);
+        s.sensors[1]["value"] = json!(60);
+    }
+}
+
+#[test]
+fn compiled_policy_tracks_curve_reordering_edits_and_fan_removal() {
+    let (_temp, mut e, _hardware, id) = setup(false);
+    let mut config = e.config.clone();
+    config["curves"] = json!([
+        {"id":"a","name":"A","points":[[20,20],[100,20]]},
+        {"id":"b","name":"B","points":[[20,70],[100,70]]}]);
+    let fan = config["fans"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|f| f["id"] == id)
+        .unwrap();
+    fan["curve_id"] = json!("b");
+    fan["response_s"] = json!(0);
+    fan["step_up"] = json!(100);
+    fan["step_down"] = json!(100);
+    e.update(&config, None).unwrap();
+    // A long elapsed interval lets the normal slew limiter settle.
+    e.tick_with(e.snapshot.clone(), e.now() + 10.).unwrap();
+    assert_eq!(num(&e.state(None, None)["outputs"][&id]["target"]), 70.);
+    config["curves"].as_array_mut().unwrap().reverse();
+    config["curves"][0]["points"] = json!([[20, 80], [100, 80]]);
+    e.update(&config, None).unwrap();
+    e.tick_with(e.snapshot.clone(), e.now() + 20.).unwrap();
+    assert_eq!(num(&e.state(None, None)["outputs"][&id]["target"]), 80.);
+    config["fans"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|f| f["id"] != id);
+    e.update(&config, None).unwrap();
+    assert!(e.state(None, None)["outputs"].get(&id).is_none());
+}
+#[test]
 fn raw_critical_bypasses_smoothing_limits_and_manual() {
     let (mut f, mut s, mut m) = policy();
     f["mode"] = json!("manual");
@@ -968,8 +1027,8 @@ fn viewer_has_no_configuration_tokens_or_discovery_and_never_writes() {
     let (_t, mut e, h, id) = setup(true);
     let config = e.config.clone();
     for _ in 0..10 {
-        let v = e.view_state();
-        for key in ["config", "csrf_token", "discovery", "history", "events"] {
+        let v = e.view_state(None, None);
+        for key in ["config", "csrf_token", "discovery", "events"] {
             assert!(v.get(key).is_none());
         }
         assert!(array(&v["fans"]).iter().any(|f| f["id"] == id));
@@ -980,13 +1039,78 @@ fn viewer_has_no_configuration_tokens_or_discovery_and_never_writes() {
 }
 
 #[test]
+fn viewer_includes_only_the_latest_eighty_temperature_samples() {
+    let (_t, mut e, h, _id) = setup(false);
+    for _ in 0..100 {
+        e.tick().unwrap();
+    }
+    let full = e.state(None, None);
+    let view = e.view_state(None, None);
+    let history = array(&full["history"]);
+    assert_eq!(array(&view["history"]), &history[history.len() - 80..]);
+    assert!(array(&view["history"])
+        .iter()
+        .all(|row| row.get("cpu").is_some() && row.get("gpu").is_some()));
+    assert_eq!(h.0.lock().unwrap().writes, 0);
+}
+
+#[test]
+fn viewer_deltas_recover_after_gaps_config_changes_and_restart() {
+    let (_t, mut e, _h, id) = setup(false);
+    for _ in 0..100 {
+        e.tick().unwrap();
+    }
+    let before = e.view_state(None, None);
+    let revision = text(&before["view_revision"]);
+    let cursor = before["history_cursor"].as_u64().unwrap();
+    let idle = e.view_state(Some(revision), Some(cursor));
+    assert_eq!(idle["history"], json!([]));
+    assert_eq!(idle["history_delta"], true);
+    assert_eq!(idle["fans_delta"], true);
+    assert!(array(&idle["fans"])
+        .iter()
+        .all(|f| f.get("points").is_none()));
+    for _ in 0..3 {
+        e.tick().unwrap();
+    }
+    let delta = e.view_state(Some(revision), Some(cursor));
+    let full = e.view_state(None, None);
+    assert_eq!(array(&delta["history"]), &array(&full["history"])[77..]);
+    for (a, b) in array(&delta["fans"]).iter().zip(array(&full["fans"])) {
+        assert_eq!(a["output"], b["output"]);
+        assert_eq!(a["id"], b["id"]);
+    }
+    for invalid_cursor in [0, u64::MAX] {
+        let reset = e.view_state(Some(revision), Some(invalid_cursor));
+        assert_eq!(reset["history_delta"], false);
+        assert_eq!(reset["history"], full["history"]);
+    }
+    e.request("/api/fan", &json!({"id":id,"changes":{"name":"new name"}}))
+        .unwrap();
+    let changed = e.view_state(Some(revision), Some(cursor));
+    assert_eq!(changed["fans_delta"], false);
+    assert_eq!(changed["history_delta"], false);
+    assert_ne!(changed["view_revision"], before["view_revision"]);
+    assert!(array(&changed["fans"])
+        .iter()
+        .any(|f| f["name"] == "new name"));
+
+    // Same configuration in a new process still requires a complete snapshot.
+    let (_t2, mut restarted, _h2, _id2) = setup(false);
+    restarted.update(&e.config, None).unwrap();
+    let reset = restarted.view_state(Some(text(&changed["view_revision"])), Some(cursor));
+    assert_eq!(reset["history_delta"], false);
+    assert_eq!(reset["fans_delta"], false);
+}
+
+#[test]
 fn viewer_resolves_shared_and_independent_curves_including_manual_mode() {
     let (_t, mut e, _h, id) = setup(true);
     let fan = array(&e.config["fans"])
         .iter()
         .find(|f| f["id"] == id)
         .unwrap();
-    let view = e.view_state();
+    let view = e.view_state(None, None);
     let shown = array(&view["fans"]).iter().find(|f| f["id"] == id).unwrap();
     assert_eq!(shown["points"], fan["points"]);
     assert!(shown["curve_name"].is_null());
@@ -1006,7 +1130,7 @@ fn viewer_resolves_shared_and_independent_curves_including_manual_mode() {
         .clone();
     e.request("/api/fan", &json!({"id":id,"changes":{"mode":"manual"}}))
         .unwrap();
-    let view = e.view_state();
+    let view = e.view_state(None, None);
     let shown = array(&view["fans"]).iter().find(|f| f["id"] == id).unwrap();
     assert_eq!(shown["points"], curve["points"]);
     assert_eq!(shown["curve_name"], "Shared display");
@@ -1018,7 +1142,7 @@ fn viewer_resolves_shared_and_independent_curves_including_manual_mode() {
     },"expected":curve}),
     )
     .unwrap();
-    let view = e.view_state();
+    let view = e.view_state(None, None);
     let shown = array(&view["fans"]).iter().find(|f| f["id"] == id).unwrap();
     assert_eq!(shown["points"], json!([[20, 0], [90, 100]]));
     assert_eq!(shown["curve_name"], "Updated display");
