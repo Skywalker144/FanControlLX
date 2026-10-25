@@ -5,7 +5,10 @@ export const formatTime=seconds=>timeFormat.format(new Date(seconds*1000));
 
 export function text(element,value){
   const next=String(value??'');
-  if(element.textContent!==next)element.textContent=next;
+  const node=element.firstChild;
+  if(node?.nodeType===Node.TEXT_NODE&&node===element.lastChild){
+    if(node.nodeValue!==next)node.nodeValue=next;
+  }else if(element.textContent!==next)element.textContent=next;
 }
 
 export function attribute(element,name,value){
@@ -38,13 +41,37 @@ export function updateOutputBar(bar,output={}){
   const width=`${Math.max(0,Math.min(100,actual??0))}%`,fill=bar.querySelector('i');
   if(fill.style.width!==width)fill.style.width=width;
   const marker=bar.querySelector('[data-output-target]');
-  marker.hidden=!available;
+  if(marker.hidden!==!available)marker.hidden=!available;
   if(available){
     const left=`${Math.max(0,Math.min(100,target))}%`;
     if(marker.style.left!==left)marker.style.left=left;
     attribute(marker,'title',`目标 ${target}%`);
   }
   attribute(bar,'aria-label',`当前输出 ${actual==null?'不可用':`${actual}%`} · 目标 ${output.automatic?'显卡自动调速':available?`${target}%`:'不可用'}`);
+}
+
+// Large workspaces keep their controls and layout, but offscreen live readouts
+// need no DOM work. Entering the viewport renders the newest state immediately.
+export function createCardVisibility(render){
+  const visibility=new WeakMap();
+  const observer=typeof IntersectionObserver==='function'?new IntersectionObserver(entries=>{
+    let entered=false;
+    for(const {target,isIntersecting} of entries){
+      if(!visibility.has(target))continue;
+      entered ||= isIntersecting&&visibility.get(target)!==true;
+      visibility.set(target,isIntersecting);
+    }
+    if(entered&&!document.hidden)render();
+  },{rootMargin:'240px'}):null;
+  return {
+    visible(card,limit){
+      if(!observer)return true;
+      if(!limit){this.remove(card);return true;}
+      if(!visibility.has(card)){visibility.set(card,null);observer.observe(card);}
+      return visibility.get(card)!==false;
+    },
+    remove(card){observer?.unobserve(card);visibility.delete(card);}
+  };
 }
 
 export function initFanColumns(select,cards){
