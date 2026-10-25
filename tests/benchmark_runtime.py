@@ -127,6 +127,35 @@ def main():
                                     "control_interval_s_max": max(intervals) if intervals else None})
                     print(json.dumps(results[-1]), flush=True)
 
+                # Fill the bounded history without a three-minute sleep. Scans
+                # use only the disposable demo and do not acquire any controls.
+                for _ in range(90):
+                    status, body, _ = request("/api/scan", {}, state["csrf_token"])
+                    if status != 200:
+                        raise RuntimeError(body.decode())
+                view = json.loads(request("/api/view")[1])
+                full_sizes, poll_sizes = [], []
+                for _ in range(20):
+                    status, body, _ = request("/api/scan", {}, state["csrf_token"])
+                    if status != 200:
+                        raise RuntimeError(body.decode())
+                    full_sizes.append(len(request("/api/view")[1]))
+                    # Old binaries naturally fall back to the complete response.
+                    path = "/api/view"
+                    if "view_revision" in view:
+                        path += f"?since={view['view_revision']}&after={view['history_cursor']}"
+                    status, body, _ = request(path)
+                    if status != 200:
+                        raise RuntimeError(body.decode())
+                    poll_sizes.append(len(body))
+                    view = json.loads(body)
+                results.append({"fans": size, "scenario": "viewer polling payload", "polls": 20,
+                                "method": "Full 80-sample history, two demo samples between reads; body sizes only; excludes scan cost and HTTP headers",
+                                "full_body_bytes_mean": statistics.mean(full_sizes),
+                                "poll_body_bytes_mean": statistics.mean(poll_sizes),
+                                "rss_bytes": usage()["rss_bytes"]})
+                print(json.dumps(results[-1]), flush=True)
+
             status, body, headers = request("/icons.svg")
             etag = headers.get("ETag")
             cached_status, cached_body, _ = request("/icons.svg", headers={"If-None-Match": etag or '"baseline"'})
