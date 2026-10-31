@@ -82,8 +82,18 @@ pub struct Client {
     sender: SyncSender<Command>,
     generation: Arc<AtomicU64>,
     healthy: Arc<AtomicBool>,
+    progress: Arc<Progress>,
     managed: bool,
 }
+
+// Only successful sampling advances this timestamp. HTTP traffic and failed
+// control cycles cannot keep a stalled controller looking healthy.
+struct Progress {
+    started: Instant,
+    sample_ms: AtomicU64,
+    cycle_ms: AtomicU64,
+}
+const STALE_AFTER_MS: u64 = 3_000;
 
 pub struct Controller {
     receiver: Receiver<Command>,
@@ -96,7 +106,12 @@ pub fn channel(engine: &Engine) -> (Controller, Client) {
     let client = Client {
         sender,
         generation: Arc::new(AtomicU64::new(0)),
-        healthy: Arc::new(AtomicBool::new(engine.error.is_none())),
+        healthy: Arc::new(AtomicBool::new(engine.healthy())),
+        progress: Arc::new(Progress {
+            started: engine.last_sample,
+            sample_ms: AtomicU64::new(0),
+            cycle_ms: AtomicU64::new(0),
+        }),
         managed: engine.managed,
     };
     (
@@ -115,8 +130,16 @@ impl Client {
     }
 
     pub fn health(&self) -> Value {
-        json!({"ok":self.healthy.load(Ordering::Acquire),"version":crate::server::VERSION,
-            "background_service":self.managed,"runtime":"rust"})
+        self.health_at(self.progress.started.elapsed().as_millis() as u64)
+    }
+
+    fn health_at(&self, elapsed_ms: u64) -> Value {
+        let age = elapsed_ms.saturating_sub(self.progress.sample_ms.load(Ordering::Acquire));
+        let stale = age >= STALE_AFTER_MS;
+        json!({"ok":self.healthy.load(Ordering::Acquire) && !stale,"version":crate::server::VERSION,
+            "background_service":self.managed,"runtime":"rust", "stale":stale,
+            "sample_age_ms":age,"stale_after_ms":STALE_AFTER_MS,
+            "control_cycle_ms":self.progress.cycle_ms.load(Ordering::Acquire)})
     }
 
     pub fn call(&self, operation: Operation) -> Result<Response> {
@@ -144,7 +167,18 @@ impl Controller {
     pub fn changed(&mut self, engine: &Engine) {
         self.client
             .healthy
-            .store(engine.error.is_none(), Ordering::Release);
+            .store(engine.healthy(), Ordering::Release);
+        self.client.progress.sample_ms.store(
+            engine
+                .last_sample
+                .saturating_duration_since(self.client.progress.started)
+                .as_millis() as u64,
+            Ordering::Release,
+        );
+        self.client
+            .progress
+            .cycle_ms
+            .store(engine.cycle_ms, Ordering::Release);
         self.invalidate();
     }
 
@@ -206,6 +240,32 @@ impl Controller {
 mod tests {
     use super::*;
     use crate::{hardware::Demo, tests::Temp};
+
+    #[test]
+    fn health_expires_without_samples_even_if_requests_change_state() {
+        let temp = Temp::new();
+        let mut engine = Engine::new(
+            Box::new(Demo::new()),
+            temp.0.join("config.json"),
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+        let (mut controller, client) = channel(&engine);
+        assert_eq!(client.health_at(0)["ok"], true);
+        controller.invalidate();
+        controller.changed(&engine);
+        assert_eq!(client.health_at(STALE_AFTER_MS)["ok"], false);
+        assert_eq!(client.health_at(STALE_AFTER_MS)["stale"], true);
+        engine.last_sample = client.progress.started + Duration::from_millis(STALE_AFTER_MS);
+        engine.cycle_ms = 42;
+        controller.changed(&engine);
+        let health = client.health_at(STALE_AFTER_MS + 1);
+        assert_eq!(health["ok"], true);
+        assert_eq!(health["sample_age_ms"], 1);
+        assert_eq!(health["control_cycle_ms"], 42);
+    }
 
     #[test]
     fn expired_command_cannot_change_configuration() {
