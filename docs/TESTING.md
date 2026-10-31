@@ -17,6 +17,9 @@
 | HTTP Host/Origin/令牌、路径限制、增量响应 | Rust Host 测试 + `tests/test_rust.py` |
 | 观看/编辑分离、隐藏页停止轮询、手机布局 | API 测试 + `tests/browser-smoke.mjs` |
 | 健康后台不定期发现、编辑租约超时、故障发现退避、实时读取 | Rust 调度测试及临时 sysfs 测试 |
+| 配置落盘后恢复失败、识别期间改绑、多个故障独立解除、看门狗停用重试 | Rust 配置及恢复回归 |
+| 控制采样阻塞时健康超期、恢复后转为健康 | Rust 时钟测试 + 模拟 NVML 阻塞进程测试 |
+| GPU 批量写入、独立令牌/期限/失败结果、批内温度共享与慢批次重新采样 | Rust 控制/Writer 测试 + 模拟 NVML 进程测试 |
 
 运行：
 
@@ -39,3 +42,15 @@ bash -n install-service.sh webui.sh build.sh
 浏览器回归使用临时演示服务，先验证默认观看页没有编辑控件、没有 POST 请求、不加载编辑脚本，再测试 `/edit` 的编辑工作流；截图保存在 `test-results/`。启动命令见 README。
 
 状态快照回归另覆盖观看快照升级为编辑快照、同版本共享、旧读取期间修改配置、缺失读数、发现结果一致性和观看接口不泄漏令牌。浏览器回归覆盖两页的大量卡片释放/恢复 SVG、滚动高度不变和恢复后的编辑入口。
+
+## 可选性能对照
+
+`tests/benchmark_runtime.py` 用临时演示实例比较后台空闲、状态请求和大配置内存；`tests/benchmark_service.py` 只读测量正在运行的真实服务组，包含 GPU 恢复进程，但不包含浏览器。两种内存口径不可混用。
+
+GPU 通信改动可以用两个已编译的版本对照：
+
+```bash
+python3 tests/benchmark_gpu.py --before /path/to/old/fancontrollx --after target/release/fancontrollx --output /tmp/fancontrollx-gpu.json
+```
+
+此测试只加载模拟 NVML，比较同一 GPU 三路自动模式下的逐路请求与批量请求，输出温度读取次数、IPC 次数和写入进程 CPU 时间。模拟结果不等于真实驱动或整个服务的收益；温度共享只在单批次内有效，超过时效的批次允许增加读取次数。
