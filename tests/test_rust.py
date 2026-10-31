@@ -443,7 +443,7 @@ class RustGPUProcessTests(unittest.TestCase):
                 if time.monotonic() >= deadline:
                     self.fail("Monitor did not start")
                 time.sleep(.05)
-        (self.data / "stall-read").touch()
+        (self.data / "stall-read").write_text("5000")
         deadline = time.monotonic() + 5
         while not (self.data / "read-started").exists():
             if time.monotonic() >= deadline:
@@ -452,10 +452,49 @@ class RustGPUProcessTests(unittest.TestCase):
         with self.assertRaises((TimeoutError, urllib.error.URLError)):
             opener.open(url, timeout=.2)
         self.assertIsNone(self.process.poll())
+        time.sleep(3.1)
+        with opener.open(f"http://127.0.0.1:{port}/api/health", timeout=1) as response:
+            health = json.load(response)
+        self.assertFalse(health["ok"])
+        self.assertTrue(health["stale"])
+        self.assertGreaterEqual(health["sample_age_ms"], health["stale_after_ms"])
         (self.data / "stall-read").unlink()
         with opener.open(url, timeout=8) as response:
             self.assertGreater(json.load(response)["sample_time"], before["sample_time"])
+        with opener.open(f"http://127.0.0.1:{port}/api/health", timeout=1) as response:
+            self.assertTrue(json.load(response)["ok"])
         self.assertFalse((self.data / "writes").exists())
+
+    def test_batch_shares_only_fresh_temperature_and_preserves_protection(self):
+        (self.data / "fan-count").write_text("3")
+        self.start(0, 0)
+        keys = [f"nvidia/GPU-abcd/fan{i}" for i in range(3)]
+        leases = [self.request("acquire", channel_id=key, duty=60)["result"] for key in keys]
+        writes = [{"channel_id":key,"token":lease["token"],"duty":60} for key,lease in zip(keys,leases)]
+        reads = self.data / "temperature-reads"
+        def batch():
+            return self.request("write-batch", writes=writes)["result"]
+        before = len(reads.read_text().splitlines())
+        started = time.monotonic()
+        result = batch()
+        elapsed = time.monotonic()-started
+        self.assertTrue(all(row["result"]["duty"] == 60 for row in result))
+        count = len(reads.read_text().splitlines())-before
+        self.assertLessEqual(count, 3)
+        if elapsed < .05:
+            self.assertEqual(count, 1)
+        (self.data / "temperature").write_text("95")
+        result = batch()
+        self.assertTrue(all(row["result"]["duty"] == 100 and row["result"]["fault"] for row in result))
+        (self.data / "temperature").write_text("invalid")
+        self.assertTrue(all(row["result"]["duty"] == 100 for row in batch()))
+        (self.data / "temperature").write_text("40")
+        (self.data / "slow-write").touch()
+        result = batch()
+        self.assertEqual(result[0]["result"]["duty"], 60)
+        self.assertTrue(all(row["result"]["duty"] == 100 for row in result[1:]))
+        (self.data / "slow-write").unlink()
+        self.assertEqual(len(self.journal()["leases"]), 3)
 
     def test_parent_eof_restores_original_manual_target(self):
         self.start(1, 42)
