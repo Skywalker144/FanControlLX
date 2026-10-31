@@ -55,6 +55,8 @@ pub struct Nvml {
     api: Api,
     handles: HashMap<String, usize>,
     limits: HashMap<usize, (Instant, (u32, u32))>,
+    batch_active: bool,
+    batch_temperatures: HashMap<usize, (Instant, bool)>,
 }
 #[derive(Clone)]
 pub struct Device {
@@ -90,6 +92,8 @@ impl Nvml {
             api,
             handles: HashMap::new(),
             limits: HashMap::new(),
+            batch_active: false,
+            batch_temperatures: HashMap::new(),
         };
         n.check(unsafe { init() })?;
         Ok(n)
@@ -271,6 +275,31 @@ impl Nvml {
             self.check(f(h as Handle, fan))
         }
     }
+    pub fn begin_batch(&mut self) {
+        self.batch_temperatures.clear();
+        self.batch_active = true;
+    }
+    pub fn end_batch(&mut self) {
+        self.batch_active = false;
+        self.batch_temperatures.clear();
+    }
+    fn hot(&mut self, handle: usize) -> bool {
+        // Never reuse parent telemetry or readings from an earlier request.
+        // A slow batch rechecks temperature before writing subsequent fans.
+        if self.batch_active {
+            if let Some((at, hot)) = self.batch_temperatures.get(&handle) {
+                if at.elapsed() < Duration::from_millis(50) {
+                    return *hot;
+                }
+            }
+        }
+        let started = Instant::now();
+        let hot = self.temperature(handle).map_or(true, |t| t >= 85.);
+        if self.batch_active {
+            self.batch_temperatures.insert(handle, (started, hot));
+        }
+        hot
+    }
     pub fn write(&mut self, key: &str, duty: f64) -> Result<Value> {
         if !duty.is_finite() || !(0.0..=100.).contains(&duty) {
             return Err(invalid("无效输出"));
@@ -278,7 +307,7 @@ impl Nvml {
         let (uuid, fan) = parse(key)?;
         let h = self.handle(uuid)?;
         let (min, max) = self.limits(h)?;
-        let hot = self.temperature(h).map_or(true, |t| t >= 85.);
+        let hot = self.hot(h);
         if duty == 0. && !hot {
             if self.fan_uint(b"nvmlDeviceGetFanControlPolicy_v2\0", h, fan)? != 0 {
                 self.auto(h, fan)?;
