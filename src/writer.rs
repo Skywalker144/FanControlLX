@@ -22,6 +22,8 @@ pub trait Gpu {
     fn original(&mut self, key: &str) -> Result<Value>;
     fn write(&mut self, key: &str, duty: f64) -> Result<Value>;
     fn restore(&mut self, lease: &Value) -> Result<()>;
+    fn begin_batch(&mut self) {}
+    fn end_batch(&mut self) {}
 }
 impl Gpu for Nvml {
     fn original(&mut self, k: &str) -> Result<Value> {
@@ -32,6 +34,12 @@ impl Gpu for Nvml {
     }
     fn restore(&mut self, l: &Value) -> Result<()> {
         Nvml::restore(self, l)
+    }
+    fn begin_batch(&mut self) {
+        Nvml::begin_batch(self);
+    }
+    fn end_batch(&mut self) {
+        Nvml::end_batch(self);
     }
 }
 pub struct Writer<G: Gpu> {
@@ -100,9 +108,35 @@ impl<G: Gpu> Writer<G> {
             .collect()
     }
     pub fn dispatch(&mut self, r: &Value) -> Result<Value> {
+        let action = text(&r["action"]);
+        if action == "write-batch" {
+            let writes = r["writes"]
+                .as_array()
+                .filter(|v| !v.is_empty() && v.len() <= 64)
+                .ok_or_else(|| invalid("NVIDIA 批量请求需要 1–64 个通道"))?;
+            let mut channels = std::collections::HashSet::new();
+            if writes
+                .iter()
+                .any(|w| !channels.insert(text(&w["channel_id"])))
+            {
+                return Err(invalid("NVIDIA 批量请求通道重复"));
+            }
+            self.gpu.begin_batch();
+            let results: Vec<_> = writes
+                .iter()
+                .map(|write| match self.dispatch_action(write, "write") {
+                    Ok(result) => json!({"result":result}),
+                    Err(e) => json!({"error":e.1}),
+                })
+                .collect();
+            self.gpu.end_batch();
+            return Ok(Value::Array(results));
+        }
+        self.dispatch_action(r, action)
+    }
+    fn dispatch_action(&mut self, r: &Value, action: &str) -> Result<Value> {
         let key = text(&r["channel_id"]);
         crate::nvml::parse(key)?;
-        let action = text(&r["action"]);
         if action == "acquire" {
             if self.leases.contains_key(key) {
                 return Err(conflict("NVIDIA 通道仍有未恢复租约"));
@@ -163,6 +197,8 @@ pub struct Client {
     reader: BufReader<UnixStream>,
     child: Child,
     pub broken: bool,
+    request_bytes: Vec<u8>,
+    response_line: String,
 }
 impl Client {
     pub fn start(data: &Path) -> Result<Self> {
@@ -192,6 +228,8 @@ impl Client {
             reader: BufReader::new(parent),
             child: process,
             broken: false,
+            request_bytes: Vec::with_capacity(1024),
+            response_line: String::with_capacity(1024),
         };
         let ready = client.receive()?;
         if ready["ready"] != true {
@@ -200,23 +238,26 @@ impl Client {
         Ok(client)
     }
     fn receive(&mut self) -> Result<Value> {
-        let mut line = String::new();
-        let n = (&mut self.reader).take(65537).read_line(&mut line)?;
+        self.response_line.clear();
+        let n = (&mut self.reader)
+            .take(65537)
+            .read_line(&mut self.response_line)?;
         if n == 0 || n > 65536 {
             return Err(conflict("NVIDIA 守护进程失联"));
         }
-        Ok(serde_json::from_str(&line)?)
+        Ok(serde_json::from_str(&self.response_line)?)
     }
     pub fn request(&mut self, r: &Value) -> Result<Value> {
-        let mut bytes = serde_json::to_vec(r)?;
-        bytes.push(b'\n');
+        self.request_bytes.clear();
+        serde_json::to_writer(&mut self.request_bytes, r)?;
+        self.request_bytes.push(b'\n');
         let response = self
             .reader
             .get_mut()
-            .write_all(&bytes)
+            .write_all(&self.request_bytes)
             .map_err(Error::from)
             .and_then(|_| self.receive());
-        let v = match response {
+        let mut v = match response {
             Ok(v) => v,
             Err(e) => {
                 self.broken = true;
@@ -226,7 +267,7 @@ impl Client {
         if let Some(e) = v["error"].as_str() {
             return Err(conflict(e));
         }
-        Ok(v["result"].clone())
+        Ok(v["result"].take())
     }
 }
 impl Drop for Client {
@@ -269,6 +310,7 @@ pub fn run(data: &Path, fd: Option<i32>, stop: Arc<AtomicBool>) -> Result<()> {
         sock.set_write_timeout(Some(Duration::from_secs(2)))?;
         sock.write_all(b"{\"ready\":true}\n")?;
         let mut pending = Vec::new();
+        let mut bytes = Vec::with_capacity(1024);
         let mut buf = [0; 4096];
         let serve = (|| -> Result<()> {
             while !stop.load(Ordering::Relaxed) {
@@ -292,15 +334,16 @@ pub fn run(data: &Path, fd: Option<i32>, stop: Arc<AtomicBool>) -> Result<()> {
                     return Err(invalid("GPU 请求过大"));
                 }
                 while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
-                    let line: Vec<_> = pending.drain(..=pos).collect();
-                    let response = match serde_json::from_slice(&line)
+                    let response = match serde_json::from_slice(&pending[..=pos])
                         .map_err(Error::from)
                         .and_then(|r| writer.dispatch(&r))
                     {
                         Ok(v) => json!({"result":v}),
                         Err(e) => json!({"error":e.1}),
                     };
-                    let mut bytes = serde_json::to_vec(&response)?;
+                    pending.drain(..=pos);
+                    bytes.clear();
+                    serde_json::to_writer(&mut bytes, &response)?;
                     bytes.push(b'\n');
                     sock.write_all(&bytes)?;
                 }
