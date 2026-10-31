@@ -8,6 +8,10 @@
 static void path(char *out, const char *name) {
     snprintf(out, 4096, "%s/%s", getenv("FANCONTROLLX_MOCK_DIR"), name);
 }
+static void counted(const char *name) {
+    char p[4096]; path(p, name); FILE *f=fopen(p,"a");
+    if(f){fputs("call\n",f);fclose(f);}
+}
 static void state(unsigned *policy, unsigned *target) {
     char p[4096]; path(p, "gpu-state");
     FILE *f = fopen(p, "r");
@@ -46,10 +50,13 @@ int nvmlDeviceGetNumFans(void *h, unsigned *v) {
 }
 int nvmlDeviceGetMinMaxFanSpeed(void *h, unsigned *min, unsigned *max) { (void)h; *min=30; *max=100; return 0; }
 int nvmlDeviceGetTemperature(void *h, unsigned sensor, unsigned *v) {
+    counted("temperature-reads");
     (void)h; (void)sensor; char p[4096]; path(p,"stall-read");
     if(access(p,F_OK)==0) {
         path(p,"read-started"); FILE *marker=fopen(p,"w");
-        if(marker){fputs("started",marker);fclose(marker);} sleep(3);
+        if(marker){fputs("started",marker);fclose(marker);}
+        unsigned ms=3000; path(p,"stall-read"); FILE *duration=fopen(p,"r");
+        if(duration){if(fscanf(duration,"%u",&ms)!=1)ms=3000;fclose(duration);} usleep(ms*1000);
     }
     path(p,"temperature");
     FILE *f=fopen(p,"r"); *v=40;
@@ -65,5 +72,13 @@ int nvmlDeviceGetFanSpeed_v2(void *h,unsigned fan,unsigned *v) { (void)h;(void)f
 int nvmlDeviceGetTargetFanSpeed(void *h,unsigned fan,unsigned *v) { return nvmlDeviceGetFanSpeed_v2(h,fan,v); }
 struct fan_speed { unsigned version,fan,speed; };
 int nvmlDeviceGetFanSpeedRPM(void *h,struct fan_speed *s) { (void)h;unsigned p,t;state(&p,&t);s->speed=t*20;return 0; }
-int nvmlDeviceSetFanSpeed_v2(void *h,unsigned fan,unsigned target) { (void)h;(void)fan;return change(1,target); }
+int nvmlDeviceSetFanSpeed_v2(void *h,unsigned fan,unsigned target) {
+    (void)h;(void)fan;int result=change(1,target);
+    char p[4096];path(p,"slow-write");
+    if(access(p,F_OK)==0) {
+        usleep(60000);path(p,"temperature");FILE *f=fopen(p,"w");
+        if(f){fputs("95",f);fclose(f);}
+    }
+    return result;
+}
 int nvmlDeviceSetDefaultFanSpeed_v2(void *h,unsigned fan) { (void)h;(void)fan;return change(0,0); }
