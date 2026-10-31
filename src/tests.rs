@@ -34,6 +34,10 @@ struct Mock {
     restores: usize,
     fail_restore: bool,
     fail_write: bool,
+    fail_disarm: bool,
+    fail_sample: bool,
+    fail_batch_first: bool,
+    last_batch_len: usize,
     acquired_duties: Vec<f64>,
 }
 #[derive(Clone)]
@@ -41,6 +45,9 @@ struct MockHardware(Arc<Mutex<Mock>>);
 impl Hardware for MockHardware {
     fn sample(&mut self, _: bool) -> Result<Snapshot> {
         let mut m = self.0.lock().unwrap();
+        if m.fail_sample {
+            return Err(conflict("sample failure"));
+        }
         m.samples += 1;
         let mut s = m.sample.clone();
         for c in &mut s.channels {
@@ -74,7 +81,28 @@ impl Hardware for MockHardware {
         m.duties.insert(text(&l["key"]).into(), num(&l["duty"]));
         Ok(())
     }
+    fn write_batch(&mut self, writes: &[(&str, f64)]) -> Vec<Result<Value>> {
+        let fail_first = {
+            let mut m = self.0.lock().unwrap();
+            m.last_batch_len = writes.len();
+            m.fail_batch_first
+        };
+        writes
+            .iter()
+            .enumerate()
+            .map(|(i, (key, duty))| {
+                if fail_first && i == 0 {
+                    Err(conflict("first channel failed"))
+                } else {
+                    self.write(key, *duty)
+                }
+            })
+            .collect()
+    }
     fn disarm(&mut self, _: &[Value]) -> Result<()> {
+        if self.0.lock().unwrap().fail_disarm {
+            return Err(conflict("disarm failure"));
+        }
         Ok(())
     }
 }
@@ -94,6 +122,10 @@ fn setup(managed: bool) -> (Temp, Engine, MockHardware, String) {
         restores: 0,
         fail_restore: false,
         fail_write: false,
+        fail_disarm: false,
+        fail_sample: false,
+        fail_batch_first: false,
+        last_batch_len: 0,
         acquired_duties: vec![],
     })));
     let mut e = Engine::new(
@@ -1270,4 +1302,179 @@ fn writer_channel_deadlines_are_independent_and_failed_acquire_restores() {
         &serde_json::from_slice::<Value>(&fs::read(journal).unwrap()).unwrap()["leases"]
     )
     .is_empty());
+}
+
+#[test]
+fn saved_configuration_and_revision_survive_identification_restore_failure() {
+    let (t, mut e, h, id) = setup(true);
+    e.request(
+        "/api/identify",
+        &json!({"channel_id":"demo/pwm1","duty":70,"device_kind":"fan"}),
+    )
+    .unwrap();
+    let revision = e.state(None, None)["config_revision"].clone();
+    h.0.lock().unwrap().fail_restore = true;
+    let error = e
+        .request(
+            "/api/fan",
+            &json!({"id":id,"changes":{"name":"Saved","autostart":true}}),
+        )
+        .unwrap_err();
+    assert!(error.1.contains("配置已保存"));
+    let disk: Value = serde_json::from_slice(&fs::read(t.0.join("config.json")).unwrap()).unwrap();
+    assert_eq!(*e.config, disk);
+    assert_eq!(e.config["fans"][0]["name"], "Saved");
+    assert_ne!(e.state(None, None)["config_revision"], revision);
+    assert!(!e.healthy());
+    assert!(!e.enabled.contains(&id));
+    h.0.lock().unwrap().fail_restore = false;
+    e.cycle();
+    assert!(e.healthy());
+    assert!(e.state(None, None)["identification"].is_null());
+    assert!(e.enabled.contains(&id));
+}
+
+#[test]
+fn failed_rebind_during_identification_never_resumes_the_old_binding() {
+    let (_t, mut e, h, id) = setup(true);
+    e.request("/api/activate", &json!({"id":id})).unwrap();
+    e.request(
+        "/api/identify",
+        &json!({"channel_id":"demo/pwm1","duty":70,"device_kind":"fan"}),
+    )
+    .unwrap();
+    let mut config = (*e.config).clone();
+    config["fans"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|f| f["id"] == id);
+    config["fans"][0]["channel_id"] = json!("demo/pwm2");
+    h.0.lock().unwrap().fail_restore = true;
+    assert!(e.update(&config, None).is_err());
+    assert!(!e.enabled.contains(&id));
+    assert_eq!(e.config["fans"][0]["identified"], false);
+    let acquires = h.0.lock().unwrap().acquires;
+    h.0.lock().unwrap().fail_restore = false;
+    e.cycle();
+    assert!(e.healthy());
+    assert!(e.leases.is_empty());
+    assert!(e.enabled.is_empty());
+    assert_eq!(h.0.lock().unwrap().acquires, acquires);
+    assert_eq!(h.0.lock().unwrap().duties["demo/pwm1"], 38.);
+}
+
+#[test]
+fn recovery_clears_only_its_own_fault_and_retries_disarm() {
+    let (_t, mut e, h, id) = setup(false);
+    e.activate(&id).unwrap();
+    h.0.lock().unwrap().fail_restore = true;
+    assert!(e.release(&id, true).is_err());
+    h.0.lock().unwrap().fail_sample = true;
+    assert!(e.tick().is_err());
+    h.0.lock().unwrap().fail_restore = false;
+    h.0.lock().unwrap().fail_disarm = true;
+    assert!(e.release(&id, true).is_err());
+    assert!(e.leases.is_empty());
+    assert!(!e.healthy());
+    h.0.lock().unwrap().fail_disarm = false;
+    e.release_all().unwrap();
+    assert!(
+        !e.healthy(),
+        "a successful restore must not clear sampling failure"
+    );
+    h.0.lock().unwrap().fail_sample = false;
+    e.scan(false).unwrap();
+    assert!(e.healthy());
+    e.activate(&id).unwrap();
+    h.0.lock().unwrap().fail_disarm = true;
+    assert!(e.release(&id, true).is_err());
+    h.0.lock().unwrap().fail_disarm = false;
+    e.tick().unwrap();
+    assert!(
+        e.healthy(),
+        "disarm must retry even after the last lease is removed"
+    );
+}
+
+#[test]
+fn gpu_batch_preserves_per_channel_authorization_deadlines_and_results() {
+    use std::time::{Duration, Instant};
+    let t = Temp::new();
+    let journal = t.0.join("leases.json");
+    let gpu = FakeGpu {
+        policy: 0,
+        target: 0,
+        writes: 0,
+        fail_restore: false,
+        fail_write: false,
+        journal: journal.clone(),
+    };
+    let mut w = Writer::new(gpu, journal).unwrap();
+    let a = "nvidia/GPU-abcd/fan0";
+    let b = "nvidia/GPU-abcd/fan1";
+    let la = w
+        .dispatch(&json!({"action":"acquire","channel_id":a,"duty":60}))
+        .unwrap();
+    let lb = w
+        .dispatch(&json!({"action":"acquire","channel_id":b,"duty":60}))
+        .unwrap();
+    let expired = Instant::now() - Duration::from_secs(1);
+    w.deadlines.insert(a.into(), expired);
+    let writes = w.gpu.writes;
+    let result = w
+        .dispatch(&json!({"action":"write-batch","writes":[
+            {"channel_id":a,"token":la["token"],"duty":70},
+            {"channel_id":b,"token":lb["token"],"duty":80}
+        ]}))
+        .unwrap();
+    assert!(result[0]["error"].is_string());
+    assert_eq!(result[1]["result"]["duty"], 80.);
+    assert_eq!(w.gpu.writes, writes + 1);
+    assert_eq!(w.deadlines[a], expired);
+    let deadline = w.deadlines[b];
+    let result = w
+        .dispatch(&json!({"action":"write-batch","writes":[
+            {"channel_id":b,"token":"stale","duty":70}
+        ]}))
+        .unwrap();
+    assert!(result[0]["error"].is_string());
+    assert_eq!(w.deadlines[b], deadline);
+    w.gpu.fail_write = true;
+    let result = w
+        .dispatch(&json!({"action":"write-batch","writes":[
+            {"channel_id":b,"token":lb["token"],"duty":70}
+        ]}))
+        .unwrap();
+    assert!(result[0]["error"].is_string());
+    assert_eq!(w.deadlines[b], deadline);
+    assert!(w
+        .dispatch(&json!({"action":"write-batch","writes":[
+            {"channel_id":b,"token":lb["token"],"duty":70},
+            {"channel_id":b,"token":lb["token"],"duty":80}
+        ]}))
+        .is_err());
+}
+
+#[test]
+fn control_batch_keeps_successful_channels_running_when_one_write_fails() {
+    let (_t, mut e, h, first) = setup(false);
+    let second = text(&e.config["fans"][1]["id"]).to_owned();
+    let channel = e.config["fans"][1]["channel_id"].clone();
+    e.request(
+        "/api/identity",
+        &json!({"channel_id":channel,"name":"Second","device_kind":"fan"}),
+    )
+    .unwrap();
+    e.activate(&first).unwrap();
+    e.activate(&second).unwrap();
+    h.0.lock().unwrap().fail_batch_first = true;
+    e.tick().unwrap();
+    assert_eq!(h.0.lock().unwrap().last_batch_len, 2);
+    assert!(!e.enabled.contains(&first));
+    assert!(e.enabled.contains(&second));
+    let state = e.state(None, None);
+    assert_eq!(state["outputs"][&first]["active"], false);
+    assert_eq!(state["outputs"][&second]["active"], true);
+    assert!(state["outputs"][&first]["fault"].is_string());
+    assert!(state["outputs"][&second]["fault"].is_null());
 }
